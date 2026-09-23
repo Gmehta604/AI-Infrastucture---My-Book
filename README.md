@@ -45,3 +45,4 @@ gradient-to-gigawatt/
 | IV · AI Infrastructure | 15 GPUs and Accelerators · 16 CUDA, Triton and Kernels · 17 Distributed Training · 18 Fine-Tuning · 19 Inference and Serving · 20 LLM Gateways · 21 RAG · 22 Agents and MCP · 23 Evals and Observability · 24 The AI Platform · 25 Data Centers and Economics |
 | V · Industry and Frontier | 26 The AI Industry Map · 27 Safety, Security and Policy · 28 The Frontier: September 2026 · 29 Your Path |
 | Appendix | Glossary |
+# AI-Infrastucture---My-Book
