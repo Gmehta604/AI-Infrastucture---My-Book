@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Neural Networks and Backpropagation · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="4">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Neural Networks and Backpropagation</h1>
+<p class="lede">A neural network is a stack of simple functions whose parameters are learned by gradient descent. In this chapter you will build one from scratch, including the automatic differentiation engine that PyTorch hides from you.</p>
+</header>
+
+<h2>The neuron</h2>
+<p>A neuron takes inputs, computes a weighted sum plus a bias, and passes it through a nonlinear <strong>activation function</strong>:</p>
+<div class="math">output = activation(w₁x₁ + w₂x₂ + … + wₙxₙ + b)</div>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    x1[&quot;x1&quot;] --&gt;|&quot;w1&quot;| S((&quot;Σ + b&quot;))
+    x2[&quot;x2&quot;] --&gt;|&quot;w2&quot;| S
+    x3[&quot;x3&quot;] --&gt;|&quot;w3&quot;| S
+    S --&gt; A[&quot;activation f&quot;]
+    A --&gt; Y[&quot;output&quot;]
+</pre>
+</figure>
+<h3>Why the nonlinearity matters</h3>
+<p>Stacking linear functions gives another linear function: <code>W₂(W₁x) = (W₂W₁)x</code>. Without activations, a 100-layer network is no more powerful than one layer. The nonlinearity is what lets depth build complex functions. The <strong>universal approximation theorem</strong> says a network with one hidden layer and enough neurons can approximate any continuous function, but depth makes it far more efficient.</p>
+<table>
+<thead>
+<tr>
+<th>Activation</th>
+<th>Formula</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sigmoid</td>
+<td>1/(1+e⁻ˣ)</td>
+<td>Saturates, so gradients vanish; now used for gates</td>
+</tr>
+<tr>
+<td>Tanh</td>
+<td>(eˣ−e⁻ˣ)/(eˣ+e⁻ˣ)</td>
+<td>Zero-centred sigmoid; used in LSTMs</td>
+</tr>
+<tr>
+<td>ReLU</td>
+<td>max(0, x)</td>
+<td>Cheap, no saturation for x&gt;0; the 2012–2019 default</td>
+</tr>
+<tr>
+<td>GELU</td>
+<td>x·Φ(x)</td>
+<td>Smooth ReLU; GPT-2, BERT</td>
+</tr>
+<tr>
+<td>SiLU / Swish</td>
+<td>x·sigmoid(x)</td>
+<td>Used inside SwiGLU</td>
+</tr>
+<tr>
+<td><strong>SwiGLU</strong></td>
+<td>(xW)·SiLU(xV)</td>
+<td>The standard in modern LLM feed-forward layers (Llama, Qwen, DeepSeek)</td>
+</tr>
+</tbody>
+</table>
+<h2>A multi-layer perceptron (MLP)</h2>
+<p>Layers of neurons connected to every neuron in the next layer form an <strong>MLP</strong> (also called a fully-connected or dense network). In matrix form, one layer is <code>h = f(Wx + b)</code>. The feed-forward block inside every Transformer is an MLP.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph IN[&quot;Input layer&quot;]
+      i1((x1))
+      i2((x2))
+      i3((x3))
+    end
+    subgraph HID[&quot;Hidden layer (ReLU)&quot;]
+      h1((h1))
+      h2((h2))
+      h3((h3))
+      h4((h4))
+    end
+    subgraph OUT[&quot;Output layer&quot;]
+      o1((y1))
+      o2((y2))
+    end
+    i1 &amp; i2 &amp; i3 --&gt; h1 &amp; h2 &amp; h3 &amp; h4
+    h1 &amp; h2 &amp; h3 &amp; h4 --&gt; o1 &amp; o2
+</pre>
+</figure>
+<h2>Backpropagation, step by step</h2>
+<p>Training needs the gradient of the loss with respect to <em>every</em> weight. Computing each separately would be hopelessly slow. <strong>Backpropagation</strong> does it in one backward sweep by reusing intermediate results, applying the chain rule from the output back to the input.</p>
+<p>Take a tiny example: <code>L = (w·x + b − y)²</code> with x=2, w=3, b=1, y=10.</p>
+<p>Forward pass:</p>
+<div class="math">z = w·x = 6
+p = z + b = 7
+e = p − y = −3
+L = e² = 9</div>
+
+<p>Backward pass (each step multiplies by a local derivative):</p>
+<div class="math">dL/de = 2e = −6
+dL/dp = dL/de · 1 = −6
+dL/db = dL/dp · 1 = −6
+dL/dz = dL/dp · 1 = −6
+dL/dw = dL/dz · x = −12</div>
+
+<p>Both gradients are negative, so increasing w and b reduces the loss, which is correct: we predicted 7 but wanted 10.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    w[&quot;w=3&quot;] --&gt; mul[&quot;z = w*x = 6&quot;]
+    x[&quot;x=2&quot;] --&gt; mul
+    mul --&gt; add[&quot;p = z+b = 7&quot;]
+    b[&quot;b=1&quot;] --&gt; add
+    add --&gt; sub[&quot;e = p-y = -3&quot;]
+    sub --&gt; sq[&quot;L = e² = 9&quot;]
+    sq -.-&gt;|&quot;dL/de = -6&quot;| sub
+    sub -.-&gt;|&quot;dL/dp = -6&quot;| add
+    add -.-&gt;|&quot;dL/db = -6&quot;| b
+    add -.-&gt;|&quot;dL/dz = -6&quot;| mul
+    mul -.-&gt;|&quot;dL/dw = -12&quot;| w
+</pre>
+</figure>
+<h2>Build an autograd engine (micrograd-style)</h2>
+<p>This is the single best exercise for understanding deep learning frameworks. Every PyTorch tensor secretly does what this <code>Value</code> class does: record how it was made, then walk the graph backwards.</p>
+<pre><code class="language-python">import math, random
+
+class Value:
+    def __init__(self, data, parents=(), op=&quot;&quot;):
+        self.data, self.grad = data, 0.0
+        self._parents, self._op = parents, op
+        self._backward = lambda: None
+
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data + other.data, (self, other), &quot;+&quot;)
+        def _backward():
+            self.grad += out.grad
+            other.grad += out.grad
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data * other.data, (self, other), &quot;*&quot;)
+        def _backward():
+            self.grad += other.data * out.grad
+            other.grad += self.data * out.grad
+        out._backward = _backward
+        return out
+
+    def tanh(self):
+        t = math.tanh(self.data)
+        out = Value(t, (self,), &quot;tanh&quot;)
+        def _backward():
+            self.grad += (1 - t * t) * out.grad
+        out._backward = _backward
+        return out
+
+    def __neg__(self): return self * -1
+    def __sub__(self, other): return self + (-other)
+    def __pow__(self, k):
+        out = Value(self.data ** k, (self,), f&quot;**{k}&quot;)
+        def _backward():
+            self.grad += k * self.data ** (k - 1) * out.grad
+        out._backward = _backward
+        return out
+    __radd__ = __add__
+    __rmul__ = __mul__
+
+    def backward(self):
+        order, seen = [], set()
+        def build(v):                      # topological sort
+            if v not in seen:
+                seen.add(v)
+                for p in v._parents: build(p)
+                order.append(v)
+        build(self)
+        self.grad = 1.0
+        for v in reversed(order):
+            v._backward()
+
+class Neuron:
+    def __init__(self, n_in):
+        self.w = [Value(random.uniform(-1, 1)) for _ in range(n_in)]
+        self.b = Value(0.0)
+    def __call__(self, x):
+        return sum((wi * xi for wi, xi in zip(self.w, x)), self.b).tanh()
+    def params(self): return self.w + [self.b]
+
+class MLP:
+    def __init__(self, sizes):
+        self.layers = [[Neuron(sizes[i]) for _ in range(sizes[i + 1])]
+                       for i in range(len(sizes) - 1)]
+    def __call__(self, x):
+        for layer in self.layers:
+            x = [n(x) for n in layer]
+        return x[0] if len(x) == 1 else x
+    def params(self): return [p for layer in self.layers for n in layer for p in n.params()]
+
+# Learn XOR, the problem that killed the perceptron in 1969
+xs = [[0, 0], [0, 1], [1, 0], [1, 1]]
+ys = [-1, 1, 1, -1]
+net = MLP([2, 4, 1])
+for step in range(500):
+    preds = [net(x) for x in xs]
+    loss = sum((p - y) ** 2 for p, y in zip(preds, ys))
+    for p in net.params(): p.grad = 0.0
+    loss.backward()
+    for p in net.params(): p.data -= 0.05 * p.grad
+print([round(net(x).data, 2) for x in xs])   # ≈ [-1, 1, 1, -1]
+</code></pre>
+<div class="callout"><p><strong>Key idea.</strong> The backward pass costs roughly <strong>twice</strong> the forward pass, because for each matmul you compute gradients with respect to both the input and the weights. Forward (2N) + backward (4N) = the <strong>6N FLOPs per token</strong> training rule from Chapter 2.</p></div>
+<h2>The same network in PyTorch</h2>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+X = torch.tensor([[0., 0.], [0., 1.], [1., 0.], [1., 1.]])
+y = torch.tensor([[0.], [1.], [1.], [0.]])
+
+model = nn.Sequential(nn.Linear(2, 8), nn.ReLU(), nn.Linear(8, 1))
+opt = torch.optim.Adam(model.parameters(), lr=0.05)
+loss_fn = nn.BCEWithLogitsLoss()
+
+for step in range(500):
+    opt.zero_grad()              # clear old gradients
+    loss = loss_fn(model(X), y)  # forward
+    loss.backward()              # backward (autograd)
+    opt.step()                   # update
+print(torch.sigmoid(model(X)).round().squeeze())
+</code></pre>
+<p>Those five lines inside the loop (<code>zero_grad</code>, forward, loss, <code>backward</code>, <code>step</code>) are the heartbeat of all deep learning, from XOR to a trillion-parameter model. Everything in distributed training (Chapter 17) is about running this loop across thousands of GPUs.</p>
+<h2>What the forward pass stores: activations</h2>
+<p>To compute gradients, the backward pass needs intermediate values from the forward pass (like <code>x</code> in <code>dL/dw = dL/dz · x</code>). These <strong>activations</strong> must be kept in memory until the backward pass uses them. For large models, activation memory often exceeds weight memory. <strong>Activation checkpointing</strong> (also called gradient checkpointing) discards some activations and recomputes them during backward, trading about 30% more compute for much less memory. You will use it in Chapters 17 and 18.</p>
+<h2>Resources</h2>
+<ul>
+<li>Andrej Karpathy, <em>The spelled-out intro to neural networks and backpropagation: building micrograd</em> (YouTube, 2.5 hours). Watch it.</li>
+<li>Michael Nielsen, <em>Neural Networks and Deep Learning</em> (free online book).</li>
+<li>3Blue1Brown, <em>Neural Networks</em> series, chapters 1–4.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

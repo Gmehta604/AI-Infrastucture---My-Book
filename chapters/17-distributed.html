@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Distributed Training · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="17">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Distributed Training</h1>
+<p class="lede">No frontier model fits on one GPU, and no frontier training run finishes on one. Distributed training splits the work across thousands of accelerators while keeping them busy. This chapter covers every parallelism strategy, the communication behind each, and how they combine.</p>
+</header>
+
+<h2>Why split at all? Two reasons</h2>
+<ol>
+<li><strong>Memory:</strong> a 70B model needs ~1.1 TB for weights, gradients and Adam state (16 bytes/parameter, Chapter 5), plus activations. One GPU has 80–288 GB.</li>
+<li><strong>Time:</strong> 10²⁵ FLOPs on one H100 at 40% utilisation would take about 800 years.</li>
+</ol>
+<h2>Collective communication: the vocabulary</h2>
+<p>All parallelism is built from a few <strong>collective operations</strong>, implemented by NCCL (NVIDIA) or RCCL (AMD).</p>
+<table>
+<thead>
+<tr>
+<th>Collective</th>
+<th>What it does</th>
+<th>Used for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>All-reduce</strong></td>
+<td>Every rank ends with the sum of all ranks' tensors</td>
+<td>Averaging gradients in data parallelism</td>
+</tr>
+<tr>
+<td><strong>Reduce-scatter</strong></td>
+<td>Sum, then each rank keeps only its 1/N slice</td>
+<td>FSDP/ZeRO gradient sharding</td>
+</tr>
+<tr>
+<td><strong>All-gather</strong></td>
+<td>Each rank contributes a slice; all ranks get the full tensor</td>
+<td>FSDP gathering weights before use</td>
+</tr>
+<tr>
+<td><strong>All-to-all</strong></td>
+<td>Each rank sends a different chunk to every other rank</td>
+<td>Expert parallelism (MoE token routing)</td>
+</tr>
+<tr>
+<td>Broadcast</td>
+<td>One rank sends to all</td>
+<td>Initial weights</td>
+</tr>
+<tr>
+<td>Send / recv</td>
+<td>Point to point</td>
+<td>Pipeline parallelism</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Ring all-reduce</strong> is bandwidth-optimal: each GPU sends and receives about 2·(N−1)/N × the data size, <em>independent of the number of GPUs</em>. An all-reduce is literally a reduce-scatter followed by an all-gather.</p>
+<pre><code class="language-python"># Minimal distributed script: run with  torchrun --nproc_per_node=4 allreduce.py
+import torch, torch.distributed as dist, os
+dist.init_process_group(&quot;nccl&quot;)
+rank = dist.get_rank(); torch.cuda.set_device(int(os.environ[&quot;LOCAL_RANK&quot;]))
+x = torch.ones(4, device=&quot;cuda&quot;) * (rank + 1)
+dist.all_reduce(x, op=dist.ReduceOp.SUM)
+print(f&quot;rank {rank}: {x.tolist()}&quot;)        # every rank prints [10, 10, 10, 10] with 4 GPUs
+dist.destroy_process_group()
+</code></pre>
+<h2>The parallelism strategies</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    P[&quot;How to split a training job&quot;] --&gt; DP[&quot;Data parallel: split the batch&quot;]
+    P --&gt; TP[&quot;Tensor parallel: split each matmul&quot;]
+    P --&gt; PP[&quot;Pipeline parallel: split the layers&quot;]
+    P --&gt; CP[&quot;Context / sequence parallel: split the sequence&quot;]
+    P --&gt; EP[&quot;Expert parallel: split the MoE experts&quot;]
+    DP --&gt; Z[&quot;ZeRO / FSDP: also shard weights, grads, optimizer state&quot;]
+</pre>
+</figure>
+<h3>1. Data parallelism (DP / DDP)</h3>
+<p>Every GPU holds a full model copy and processes a different slice of the batch. After the backward pass, gradients are <strong>all-reduced</strong> so all copies stay identical. PyTorch's <code>DistributedDataParallel</code> overlaps the all-reduce with the backward pass by bucketing gradients.</p>
+<ul>
+<li>Simple and scales well, but every GPU must fit the whole model plus optimizer state.</li>
+</ul>
+<h3>2. ZeRO and FSDP: sharded data parallelism</h3>
+<p>Microsoft's <strong>ZeRO</strong> (2019) observed that in DDP every GPU stores identical copies of optimizer state, gradients and weights, which is wasteful. Shard them:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Sharded</th>
+<th>Memory per GPU for 70B on 64 GPUs (approx.)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DDP</td>
+<td>Nothing</td>
+<td>~1,120 GB (doesn't fit)</td>
+</tr>
+<tr>
+<td>ZeRO-1</td>
+<td>Optimizer state</td>
+<td>~140 + 140 + 840/64 ≈ 293 GB</td>
+</tr>
+<tr>
+<td>ZeRO-2</td>
+<td>+ gradients</td>
+<td>~140 + (140 + 840)/64 ≈ 155 GB</td>
+</tr>
+<tr>
+<td>ZeRO-3 / <strong>FSDP</strong></td>
+<td>+ weights</td>
+<td>~1,120/64 ≈ 17.5 GB (+ activations)</td>
+</tr>
+</tbody>
+</table>
+<p>With FSDP, before each layer runs, GPUs <strong>all-gather</strong> that layer's weights, compute, then free them. After backward, gradients are <strong>reduce-scattered</strong> so each GPU updates only its shard. Communication is 1.5× DDP's, but memory scales down with GPU count. <strong>FSDP2</strong> (PyTorch, per-parameter sharding with DTensor) is the modern API.</p>
+<pre><code class="language-python">import torch, torch.distributed as dist
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+
+dist.init_process_group(&quot;nccl&quot;)
+model = GPT(cfg).cuda()                     # from Chapter 9
+mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+for block in model.blocks:
+    fully_shard(block, mp_policy=mp)        # shard each Transformer block
+fully_shard(model, mp_policy=mp)            # then the root (embeddings, head)
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)
+# the training loop is unchanged; launch with: torchrun --nnodes=4 --nproc_per_node=8 train.py
+</code></pre>
+<h3>3. Tensor parallelism (TP)</h3>
+<p>Split individual weight matrices across GPUs (Megatron-LM, 2019). For the MLP: split the first matrix <strong>by columns</strong> and the second <strong>by rows</strong>; each GPU computes a partial result, and one all-reduce combines them.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    X[&quot;X (replicated on 2 GPUs)&quot;] --&gt; A1[&quot;GPU0: X·A[:, 0:half] → GeLU&quot;]
+    X --&gt; A2[&quot;GPU1: X·A[:, half:] → GeLU&quot;]
+    A1 --&gt; B1[&quot;GPU0: · B[0:half, :] → partial Y0&quot;]
+    A2 --&gt; B2[&quot;GPU1: · B[half:, :] → partial Y1&quot;]
+    B1 --&gt; AR[&quot;All-reduce: Y = Y0 + Y1&quot;]
+    B2 --&gt; AR
+</pre>
+</figure>
+<p>Attention splits naturally by heads. TP needs all-reduces in every layer, twice forward and twice backward, so it must stay inside the <strong>NVLink domain</strong> (typically TP=8 on HGX nodes; larger on NVL72).</p>
+<h3>4. Pipeline parallelism (PP)</h3>
+<p>Put different layers on different GPUs: layers 1–20 on stage 0, 21–40 on stage 1, and so on. Split the batch into <strong>micro-batches</strong> and stream them through so stages work concurrently. The idle time at the start and end is the <strong>pipeline bubble</strong>.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    S0[&quot;Stage 0: layers 1-20&quot;] --&gt;|&quot;activations&quot;| S1[&quot;Stage 1: layers 21-40&quot;]
+    S1 --&gt;|&quot;activations&quot;| S2[&quot;Stage 2: layers 41-60&quot;]
+    S2 --&gt;|&quot;activations&quot;| S3[&quot;Stage 3: layers 61-80&quot;]
+    S3 -.-&gt;|&quot;gradients flow back&quot;| S0
+</pre>
+</figure>
+<div class="math">Bubble fraction ≈ (p − 1) / (m + p − 1)       p = stages, m = micro-batches
+e.g., p = 8, m = 64  →  ~10% idle</div>
+
+<p>Schedules: GPipe, <strong>1F1B</strong> (one-forward-one-backward), interleaved 1F1B, zero-bubble schedules, and DeepSeek's <strong>DualPipe</strong>, which overlaps computation and communication in both directions. PP only needs point-to-point sends between neighbours, so it tolerates slower inter-node links.</p>
+<h3>5. Context / sequence parallelism (CP / SP)</h3>
+<p>For long sequences, activations are huge. <strong>Sequence parallelism</strong> splits LayerNorm/dropout activations along the sequence dimension alongside TP. <strong>Context parallelism / ring attention</strong> splits the sequence across GPUs for attention itself: each GPU holds a chunk of queries and passes K/V chunks around a ring. Essential for 128K–1M-token training.</p>
+<h3>6. Expert parallelism (EP)</h3>
+<p>For MoE models, place different experts on different GPUs. Each token is sent (<strong>all-to-all</strong>) to the GPUs holding its chosen experts and results are sent back. Communication is heavy and bursty; libraries like <strong>DeepEP</strong> (DeepSeek) optimise these kernels, and large NVLink domains help enormously.</p>
+<h2>Putting it together: 3D/4D/5D parallelism</h2>
+<p>Large runs combine them, mapped to the network hierarchy:</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    subgraph Cluster[&quot;e.g., 16,384 GPUs&quot;]
+      DPg[&quot;Data parallel / FSDP across groups (slowest links OK)&quot;]
+      subgraph Replica[&quot;One model replica&quot;]
+        PPg[&quot;Pipeline stages across nodes&quot;]
+        subgraph Node[&quot;Inside NVLink domain&quot;]
+          TPg[&quot;Tensor parallel (+ sequence parallel)&quot;]
+          EPg[&quot;Expert parallel&quot;]
+        end
+      end
+    end
+</pre>
+</figure>
+<p>Llama 3 405B used TP=8, PP=16, CP up to 16 for long context, and DP for the rest, on up to 16,384 H100s. A rule of thumb: <strong>put the most communication-hungry parallelism on the fastest links.</strong> TP and EP inside NVLink, PP across nearby nodes, DP/FSDP across everything.</p>
+<h2>Frameworks</h2>
+<table>
+<thead>
+<tr>
+<th>Framework</th>
+<th>Strengths</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>PyTorch FSDP2 + DTensor, TorchTitan</strong></td>
+<td>Native PyTorch; composable 4D parallelism; the reference for new work</td>
+</tr>
+<tr>
+<td><strong>Megatron-LM / Megatron Core</strong> (NVIDIA)</td>
+<td>Highest performance TP/PP/CP/EP on NVIDIA; used by many labs</td>
+</tr>
+<tr>
+<td><strong>DeepSpeed</strong> (Microsoft)</td>
+<td>ZeRO originator; easy scaling for fine-tuning</td>
+</tr>
+<tr>
+<td><strong>JAX + XLA / MaxText, Pax</strong></td>
+<td>Google TPU stack; sharding annotations with <code>jit</code></td>
+</tr>
+<tr>
+<td><strong>NeMo</strong> (NVIDIA)</td>
+<td>End-to-end training and post-training recipes</td>
+</tr>
+<tr>
+<td><strong>Hugging Face Accelerate / nanotron</strong></td>
+<td>Simple multi-GPU wrappers; educational</td>
+</tr>
+</tbody>
+</table>
+<h2>Fault tolerance and checkpointing</h2>
+<ul>
+<li><strong>Checkpoint</strong> model and optimizer state regularly. For a 400B model this is several TB; write asynchronously and in parallel (PyTorch Distributed Checkpoint), or snapshot to CPU memory of peer nodes for fast recovery.</li>
+<li><strong>Elastic training</strong> (torchrun elastic, TorchFT) continues with fewer replicas when nodes fail.</li>
+<li><strong>Health checks</strong> before and during jobs: DCGM diagnostics, NCCL all-reduce tests to find slow links, straggler detection.</li>
+<li><strong>Silent data corruption</strong>: rare faulty chips compute wrong answers without crashing. Large operators run periodic checksum and redundant computation tests.</li>
+</ul>
+<h2>Measuring efficiency</h2>
+<pre><code class="language-python">def mfu(n_params, tokens_per_sec, n_gpus, peak_flops=989e12):
+    return 6 * n_params * tokens_per_sec / (n_gpus * peak_flops)
+
+print(f&quot;{mfu(70e9, 1.2e6, 1024):.1%}&quot;)    # 70B at 1.2M tokens/s on 1,024 H100s ≈ 50%
+</code></pre>
+<p>(For long sequences, add attention FLOPs: about 12·L·T·d per token.)</p>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project: Scale a training job from 1 to 16 GPUs and explain every loss of efficiency</h3>
+<p><strong>Business problem:</strong> a startup's fine-tuning jobs take 3 days on one node. They want to know if 4 nodes will take 18 hours or 30.</p>
+<ol>
+<li>Rent 2–4 nodes of 8 GPUs (RunPod, Lambda, CoreWeave, or a cloud spot cluster).</li>
+<li>Train a 1B–8B model with TorchTitan or FSDP2. Measure throughput at 1, 8, 16 and 32 GPUs.</li>
+<li>Run <code>nccl-tests</code> (all_reduce_perf) to measure actual bus bandwidth within and across nodes.</li>
+<li>Try TP=2 vs. pure FSDP, activation checkpointing on/off, different micro-batch sizes.</li>
+<li>Deliverable: a scaling-efficiency chart and a recommendation with cost per run.</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Hugging Face, <em>The Ultra-Scale Playbook: Training LLMs on GPU Clusters</em> (2025). Start here.</li>
+<li>Rajbhandari et al., <em>ZeRO</em> (2019); Shoeybi et al., <em>Megatron-LM</em> (2019); Narayanan et al., <em>Efficient Large-Scale Language Model Training on GPU Clusters</em> (2021).</li>
+<li>Google DeepMind, <em>How to Scale Your Model</em>, sharding chapters.</li>
+<li>PyTorch <strong>TorchTitan</strong> repository and FSDP2 tutorials.</li>
+<li>Stas Bekman, <em>Machine Learning Engineering Open Book</em> (GitHub): practical cluster wisdom.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

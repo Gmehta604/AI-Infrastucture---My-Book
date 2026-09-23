@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Training Deep Networks Well · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="5">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Training Deep Networks Well</h1>
+<p class="lede">Knowing backprop is not the same as training a large network successfully. This chapter covers the practical toolkit: optimizers, initialisation, normalisation, learning-rate schedules, regularisation and mixed precision. Every modern LLM training run uses all of them.</p>
+</header>
+
+<h2>A complete, modern training loop</h2>
+<p>Keep this template; later chapters extend it.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import math
+
+device = &quot;cuda&quot; if torch.cuda.is_available() else &quot;cpu&quot;
+X, y = torch.randn(10_000, 128), torch.randint(0, 10, (10_000,))
+loader = DataLoader(TensorDataset(X, y), batch_size=256, shuffle=True)
+
+model = nn.Sequential(
+    nn.Linear(128, 512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(0.1),
+    nn.Linear(512, 10),
+).to(device)
+
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
+total_steps, warmup = 20 * len(loader), 200
+
+def lr_at(step):                        # linear warmup + cosine decay
+    if step &lt; warmup:
+        return step / warmup
+    p = (step - warmup) / (total_steps - warmup)
+    return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * p))
+sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
+
+step = 0
+for epoch in range(20):
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == &quot;cuda&quot;):
+            loss = F.cross_entropy(model(xb), yb)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)   # gradient clipping
+        opt.step(); sched.step(); step += 1
+    print(epoch, loss.item(), sched.get_last_lr()[0])
+</code></pre>
+<p>Every line in that loop is explained below.</p>
+<h2>Optimizers: from SGD to AdamW (and beyond)</h2>
+<p><strong>SGD</strong> (stochastic gradient descent) uses the gradient from a random mini-batch rather than the full dataset. It is noisy but cheap, and the noise can even help generalisation.</p>
+<p><strong>Momentum</strong> keeps a running average of past gradients, like a ball rolling downhill that builds speed along consistent directions and damps oscillation.</p>
+<p><strong>Adam</strong> (2014) keeps two running averages per parameter: the mean of gradients (momentum, <code>m</code>) and the mean of squared gradients (<code>v</code>). It divides the step by <code>√v</code>, so each parameter gets its own adaptive learning rate.</p>
+<div class="math">m ← β₁m + (1−β₁)g
+v ← β₂v + (1−β₂)g²
+w ← w − η · m̂ / (√v̂ + ε)          (m̂, v̂ are bias-corrected)</div>
+
+<p><strong>AdamW</strong> (2017) applies weight decay directly to the weights rather than through the gradient, which works better. AdamW is the default for LLMs. LLM settings are typically β₁=0.9, β₂=0.95, weight decay 0.1.</p>
+<p><strong>Infrastructure consequence:</strong> Adam stores <code>m</code> and <code>v</code> for every parameter, usually in FP32. With FP32 master weights, that is 4+4+4 = 12 bytes of optimizer state per parameter, plus 2 bytes of BF16 weights and 2 of gradients: about <strong>16 bytes per parameter</strong>. A 70B model needs over 1.1 TB just for this, before activations. This number drives the whole design of ZeRO/FSDP (Chapter 17).</p>
+<p><strong>Newer optimizers.</strong> <strong>Muon</strong> (2024), which orthogonalises the momentum matrix for each 2-D weight using Newton–Schulz iterations, was used at scale by Moonshot for Kimi K2 and has become a serious AdamW alternative for hidden-layer matrices. Others include Lion, Sophia, Shampoo and SOAP. AdamW remains the safe default.</p>
+<h2>Learning rate: the most important hyperparameter</h2>
+<ul>
+<li>Too high: loss explodes or oscillates.</li>
+<li>Too low: training crawls and may stall.</li>
+</ul>
+<p><strong>Warmup</strong> starts at a tiny learning rate and ramps up over the first few hundred or thousand steps, because early gradients are large and Adam's variance estimate is unreliable. <strong>Cosine decay</strong> then lowers it smoothly. <strong>WSD (warmup–stable–decay)</strong> schedules, popular since 2024, hold the rate constant and decay sharply at the end, which makes it easy to continue training from a checkpoint.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Warmup: 0 to peak LR&quot;] --&gt; B[&quot;Stable or cosine phase&quot;]
+    B --&gt; C[&quot;Decay to ~10% of peak&quot;]
+    C --&gt; D[&quot;Optional annealing on high-quality data&quot;]
+</pre>
+</figure>
+<h2>Initialisation</h2>
+<p>If weights start too large, activations explode layer by layer; too small, they vanish. <strong>Xavier/Glorot</strong> and <strong>Kaiming/He</strong> initialisation scale random weights by 1/√(fan-in) so the variance of activations stays roughly constant through depth. GPT-2 additionally scales residual-output projections by 1/√(number of layers).</p>
+<h2>Normalisation</h2>
+<p>Normalisation layers rescale activations to have a stable mean and variance.</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Normalises over</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BatchNorm</td>
+<td>The batch dimension</td>
+<td>CNNs; awkward for sequences and small batches</td>
+</tr>
+<tr>
+<td>LayerNorm</td>
+<td>The feature dimension of each token</td>
+<td>Original Transformer, GPT-2</td>
+</tr>
+<tr>
+<td><strong>RMSNorm</strong></td>
+<td>Features, without subtracting the mean</td>
+<td>Llama, Qwen, DeepSeek; cheaper and just as good</td>
+</tr>
+</tbody>
+</table>
+<p>Modern LLMs use <strong>pre-norm</strong> (normalise the input to each sub-layer) rather than post-norm, because it trains stably at depth. Some add <strong>QK-norm</strong> (normalising queries and keys) to prevent attention logits from blowing up.</p>
+<h2>Residual connections</h2>
+<p>A residual (skip) connection adds a layer's input to its output: <code>x = x + f(x)</code>. Gradients flow straight through the addition, so very deep networks train. Every Transformer block has two of them. Think of the model as a "residual stream" that each layer reads from and writes a small update into; interpretability research (Chapter 27) is built on this picture.</p>
+<h2>Regularisation</h2>
+<ul>
+<li><strong>Weight decay</strong>: pulls weights toward zero.</li>
+<li><strong>Dropout</strong>: randomly zeroes activations during training. Common in small models and fine-tuning; usually <strong>off</strong> in large-scale LLM pretraining, where data is abundant.</li>
+<li><strong>Data augmentation</strong>: flips, crops and noise for images.</li>
+<li><strong>Early stopping</strong>: stop when validation loss stops improving.</li>
+</ul>
+<h2>Gradient clipping and loss spikes</h2>
+<p>Large models occasionally produce huge gradients that cause <strong>loss spikes</strong>. Clipping the global gradient norm to 1.0 is standard. Big training runs still spike; teams keep checkpoints and can roll back a few hundred steps and skip the offending data batch. Handling this automatically is a real infrastructure job.</p>
+<h2>Mixed precision</h2>
+<p>Training in BF16 halves memory and doubles speed on tensor cores compared with FP32. The recipe:</p>
+<ol>
+<li>Keep an FP32 <strong>master copy</strong> of weights.</li>
+<li>Run the forward and backward passes in BF16.</li>
+<li>Do the optimizer update in FP32.</li>
+<li>(FP16 only) Multiply the loss by a scale factor so small gradients do not underflow to zero.</li>
+</ol>
+<p><code>torch.autocast</code> does steps 2 and 3 automatically. FP8 training (Chapter 16) pushes this further with per-block scaling factors.</p>
+<h2>Batch size and gradient accumulation</h2>
+<p>Larger batches give smoother gradients and better GPU utilisation, up to a <strong>critical batch size</strong> beyond which returns diminish. LLMs use batches of millions of tokens. If one GPU cannot hold that, you <strong>accumulate gradients</strong> over several micro-batches before stepping:</p>
+<pre><code class="language-python">accum = 8
+for i, (xb, yb) in enumerate(loader):
+    loss = F.cross_entropy(model(xb), yb) / accum
+    loss.backward()                       # gradients add up
+    if (i + 1) % accum == 0:
+        opt.step(); opt.zero_grad()
+</code></pre>
+<h2>Debugging checklist</h2>
+<ol>
+<li><strong>Overfit one batch first.</strong> If the model cannot drive loss to ~0 on 32 examples, there is a bug.</li>
+<li>Check the initial loss. For 10 classes, loss should start near −ln(1/10) ≈ 2.30.</li>
+<li>Plot loss, gradient norm, and learning rate every step.</li>
+<li>Watch for NaNs. Common causes: learning rate too high, log(0), FP16 overflow.</li>
+<li>Log <strong>tokens per second</strong> and <strong>MFU</strong> (model FLOPs utilisation) from day one. Those are the infrastructure metrics you will be judged on.</li>
+</ol>
+<h2>Resources</h2>
+<ul>
+<li>Karpathy, <em>A Recipe for Training Neural Networks</em> (blog, 2019).</li>
+<li>Goodfellow, Bengio and Courville, <em>Deep Learning</em> (free online), chapters 6–8.</li>
+<li>Google Research, <em>Deep Learning Tuning Playbook</em> (GitHub).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

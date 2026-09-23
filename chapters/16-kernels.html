@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Software Stack: CUDA, Triton, Kernels and Compilers · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="16">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>The Software Stack: CUDA, Triton, Kernels and Compilers</h1>
+<p class="lede">Between your PyTorch code and the silicon sits a deep software stack. Knowing it lets you find where time is actually spent and fix it: fuse kernels, pick the right precision, or write a custom kernel when nothing else is fast enough. Kernel engineers are some of the most sought-after people in AI.</p>
+</header>
+
+<h2>The stack</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    A[&quot;Your code: PyTorch / JAX&quot;] --&gt; B[&quot;Framework ops (aten), autograd&quot;]
+    B --&gt; C[&quot;Compilers: torch.compile (Dynamo + Inductor), XLA, TensorRT&quot;]
+    C --&gt; D[&quot;Kernel libraries: cuBLAS / cuBLASLt, cuDNN, CUTLASS, FlashAttention, FlashInfer, DeepGEMM&quot;]
+    C --&gt; E[&quot;Generated kernels: Triton, CUDA C++, CuTe DSL&quot;]
+    D --&gt; F[&quot;CUDA runtime and driver&quot;]
+    E --&gt; F
+    F --&gt; G[&quot;PTX / SASS machine code on SMs&quot;]
+    B --&gt; H[&quot;Communication: NCCL / RCCL over NVLink, InfiniBand&quot;]
+</pre>
+</figure>
+<h2>The CUDA programming model in five minutes</h2>
+<p>You write a <strong>kernel</strong>, a function that runs on the GPU. You launch it on a <strong>grid</strong> of <strong>thread blocks</strong>; each block has up to 1,024 <strong>threads</strong>. Threads execute in groups of 32 called <strong>warps</strong> that run in lockstep. Each block runs on one SM and can share fast <strong>shared memory</strong>.</p>
+<pre><code class="language-cpp">// vector add in CUDA C++
+__global__ void add(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // global thread index
+    if (i &lt; n) c[i] = a[i] + b[i];
+}
+// launch: enough blocks of 256 threads to cover n elements
+// add&lt;&lt;&lt;(n + 255) / 256, 256&gt;&gt;&gt;(a, b, c, n);
+</code></pre>
+<p>Rules of performance:</p>
+<ol>
+<li><strong>Coalesced memory access</strong>: adjacent threads should read adjacent addresses.</li>
+<li><strong>Reuse data from shared memory/registers</strong> (tiling) instead of re-reading HBM.</li>
+<li><strong>Occupancy</strong>: enough warps in flight to hide memory latency.</li>
+<li><strong>Avoid warp divergence</strong>: branches that split a warp serialise.</li>
+<li><strong>Use tensor cores</strong> via the right data types, shapes (multiples of 8/16/64) and instructions (WMMA, WGMMA on Hopper, tcgen05 on Blackwell).</li>
+</ol>
+<h2>Kernel fusion: the biggest easy win</h2>
+<p>Each separate PyTorch op launches a kernel that reads its input from HBM and writes its output back. A chain like <code>y = gelu(x @ W + b)</code> done naively makes several round trips. <strong>Fusion</strong> does the bias add and GELU while the matmul result is still in registers.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph Unfused[&quot;Unfused: 3 kernels, 3 HBM round trips&quot;]
+      U1[&quot;matmul → HBM&quot;] --&gt; U2[&quot;read, + bias → HBM&quot;] --&gt; U3[&quot;read, GELU → HBM&quot;]
+    end
+    subgraph Fused[&quot;Fused: 1 kernel&quot;]
+      F1[&quot;matmul, + bias, GELU in registers → HBM once&quot;]
+    end
+</pre>
+</figure>
+<p>Elementwise ops are memory-bound, so fusing them is nearly free speed.</p>
+<h2>torch.compile</h2>
+<p>PyTorch 2's compiler traces your Python (TorchDynamo), builds a graph, and generates fused Triton kernels (TorchInductor). One line often gives 1.3–2× speedups in training and more in inference.</p>
+<pre><code class="language-python">import torch
+model = torch.compile(model)                           # default
+model = torch.compile(model, mode=&quot;max-autotune&quot;)      # tries kernel configs, uses CUDA graphs
+</code></pre>
+<p><strong>CUDA graphs</strong> record a whole sequence of kernel launches and replay it with one call, removing CPU launch overhead. They matter a lot in LLM decode, where each step is many tiny kernels.</p>
+<h2>Triton: GPU kernels in Python</h2>
+<p><strong>Triton</strong> (OpenAI, 2021) lets you write block-level GPU kernels in Python; the compiler handles thread-level details, memory coalescing and shared memory. It is the practical entry point to kernel writing.</p>
+<pre><code class="language-python">import torch, triton, triton.language as tl
+
+@triton.jit
+def softmax_kernel(out_ptr, in_ptr, stride, n_cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)                               # one program per row
+    cols = tl.arange(0, BLOCK)
+    mask = cols &lt; n_cols
+    x = tl.load(in_ptr + row * stride + cols, mask=mask, other=-float(&quot;inf&quot;))
+    x = x - tl.max(x, axis=0)                            # stability
+    num = tl.exp(x)
+    y = num / tl.sum(num, axis=0)
+    tl.store(out_ptr + row * stride + cols, y, mask=mask)
+
+def softmax(x):
+    n_rows, n_cols = x.shape
+    out = torch.empty_like(x)
+    BLOCK = triton.next_power_of_2(n_cols)
+    softmax_kernel[(n_rows,)](out, x, x.stride(0), n_cols, BLOCK=BLOCK)
+    return out
+
+x = torch.randn(4096, 1024, device=&quot;cuda&quot;)
+assert torch.allclose(softmax(x), torch.softmax(x, dim=1), atol=1e-6)
+</code></pre>
+<p>This fused softmax reads each row from HBM once and writes once, versus several passes for a naive implementation. Newer options include <strong>CuTe DSL</strong> (Python for CUTLASS), <strong>ThunderKittens</strong>, <strong>TileLang</strong> and Helion.</p>
+<h2>FlashAttention: the most important kernel of the decade</h2>
+<p>Standard attention materialises the T×T score matrix in HBM. For T=32,000 that is a billion entries per head, far too much memory and bandwidth.</p>
+<p><strong>FlashAttention</strong> (Tri Dao, 2022) never materialises it. It tiles Q, K and V into blocks that fit in shared memory and computes softmax <strong>incrementally</strong> with the "online softmax" trick, keeping a running max and running sum per row and rescaling as each new block arrives.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    A[&quot;Load a block of Q into shared memory&quot;] --&gt; B[&quot;For each block of K, V:&quot;]
+    B --&gt; C[&quot;Compute S = Q·Kᵀ for this tile (on-chip)&quot;]
+    C --&gt; D[&quot;Update running max m and running sum l&quot;]
+    D --&gt; E[&quot;Rescale partial output, add softmax(S)·V&quot;]
+    E --&gt; B
+    B --&gt;|&quot;done&quot;| F[&quot;Write final output block to HBM once&quot;]
+</pre>
+</figure>
+<pre><code class="language-python">import torch
+def online_softmax_attention(q, K, V, block=128):
+    # q: (d,), K, V: (T, d). Processes K/V in blocks, never storing all scores.
+    m, l = torch.tensor(-float(&quot;inf&quot;)), torch.tensor(0.0)
+    acc = torch.zeros_like(V[0])
+    for s in range(0, K.shape[0], block):
+        scores = K[s:s + block] @ q / q.shape[0] ** 0.5
+        m_new = torch.maximum(m, scores.max())
+        scale = torch.exp(m - m_new)                  # rescale old accumulators
+        p = torch.exp(scores - m_new)
+        l = l * scale + p.sum()
+        acc = acc * scale + p @ V[s:s + block]
+        m = m_new
+    return acc / l
+
+q, K, V = torch.randn(64), torch.randn(1000, 64), torch.randn(1000, 64)
+ref = torch.softmax(K @ q / 8, 0) @ V
+print(torch.allclose(online_softmax_attention(q, K, V), ref, atol=1e-5))  # True
+</code></pre>
+<p>Results: memory linear in sequence length instead of quadratic, 2–4× faster, and long context became practical. FlashAttention-2 improved parallelism; <strong>FlashAttention-3</strong> (2024) used Hopper's asynchronous TMA and warp specialisation and FP8; <strong>FlashAttention-4</strong> (2025) targets Blackwell. For inference, <strong>FlashInfer</strong> and FlashMLA provide attention kernels over paged KV caches.</p>
+<h2>Low-precision training: FP8 and beyond</h2>
+<p>FP8 doubles tensor-core throughput over BF16 and halves memory traffic. The challenge is range: FP8 E4M3 represents only about ±448. Solutions:</p>
+<ul>
+<li><strong>Per-tensor scaling</strong> (NVIDIA Transformer Engine): track the max absolute value and scale into range.</li>
+<li><strong>Fine-grained block scaling</strong> (DeepSeek-V3): a scale per 1×128 activation tile and 128×128 weight block, with higher-precision accumulation. DeepSeek trained V3 almost entirely in FP8.</li>
+<li><strong>Microscaling formats</strong> (MXFP8, MXFP4, NVFP4): hardware-supported block scales on Blackwell. NVFP4 uses a scale per 16 values.</li>
+</ul>
+<h2>Profiling: measure before optimising</h2>
+<pre><code class="language-python">from torch.profiler import profile, ProfilerActivity, schedule
+
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+             schedule=schedule(wait=1, warmup=1, active=3),
+             on_trace_ready=torch.profiler.tensorboard_trace_handler(&quot;./trace&quot;),
+             record_shapes=True, with_stack=True) as prof:
+    for step in range(5):
+        train_step()
+        prof.step()
+print(prof.key_averages().table(sort_by=&quot;cuda_time_total&quot;, row_limit=15))
+</code></pre>
+<p>Then open the trace in Perfetto or TensorBoard. Tools to know: <strong>Nsight Systems</strong> (timeline across CPU, GPU, NCCL), <strong>Nsight Compute</strong> (deep dive into one kernel's memory and compute efficiency), and PyTorch's memory snapshot tool for out-of-memory debugging.</p>
+<p>Common findings:
+- GPU idle gaps waiting for the data loader (fix: more workers, pinned memory, prefetching).
+- Many tiny kernels with CPU launch overhead (fix: torch.compile, CUDA graphs).
+- Communication not overlapped with compute (fix: FSDP prefetch, bucket sizes, Chapter 17).
+- Matmul shapes not multiples of 64/128 (fix: pad vocab size, hidden sizes).</p>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project: Kernel optimisation report</h3>
+<p><strong>Business problem:</strong> a team's custom model trains at 18% MFU; they are paying for five times the GPUs they need.</p>
+<ol>
+<li>Take the GPT from Chapter 9. Profile a training step with the PyTorch profiler.</li>
+<li>Apply, one at a time: BF16 autocast, <code>scaled_dot_product_attention</code> (FlashAttention), <code>torch.compile</code>, fused AdamW (<code>fused=True</code>), a padded vocab size (multiple of 128).</li>
+<li>Write a Triton kernel for fused RMSNorm and benchmark it against PyTorch with <code>triton.testing.do_bench</code>.</li>
+<li>Deliverable: a waterfall chart of MFU gains per change and the resulting cost savings.</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li><em>Programming Massively Parallel Processors</em> (Hwu, Kirk, El Hajj), the CUDA textbook.</li>
+<li><strong>GPU MODE</strong> lectures (YouTube) and Discord.</li>
+<li>Triton tutorials (triton-lang.org): vector add, fused softmax, matmul, FlashAttention.</li>
+<li>Dao et al., <em>FlashAttention</em> 1, 2 and 3 papers.</li>
+<li>Simon Boehm, <em>How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance</em> (blog).</li>
+<li>PyTorch blog on <code>torch.compile</code> and the PyTorch profiler docs.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

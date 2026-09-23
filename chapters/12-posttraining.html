@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Post-Training: From Base Model to Assistant · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="12">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Post-Training: From Base Model to Assistant</h1>
+<p class="lede">A pretrained base model is a brilliant autocomplete, not an assistant. Ask it a question and it may continue with three more questions. Post-training turns it into something helpful, honest and safe, and since 2024 it has also become the main route to reasoning ability. This chapter covers SFT, RLHF, DPO, constitutional methods and reinforcement learning with verifiable rewards.</p>
+</header>
+
+<h2>The post-training pipeline</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Base model&quot;] --&gt; B[&quot;SFT: supervised fine-tuning on demonstrations&quot;]
+    B --&gt; C[&quot;Preference optimisation: RLHF (PPO) or DPO&quot;]
+    C --&gt; D[&quot;RL with verifiable rewards: math, code, tool use, agents&quot;]
+    D --&gt; E[&quot;Safety training, red-teaming, evals&quot;]
+    E --&gt; F[&quot;Released assistant model&quot;]
+    D -.-&gt;|&quot;distil reasoning traces&quot;| G[&quot;Smaller student models&quot;]
+</pre>
+</figure>
+<p>Real pipelines loop: several rounds of SFT and RL, with data from each round feeding the next.</p>
+<h2>Stage 1: Supervised fine-tuning (SFT)</h2>
+<p>Train on (prompt, ideal response) pairs formatted with the chat template. The loss is next-token prediction <strong>only on the response tokens</strong> (the prompt is masked out).</p>
+<pre><code class="language-python">import torch.nn.functional as F
+
+def sft_loss(model, input_ids, prompt_lens):
+    logits, _ = model(input_ids[:, :-1])
+    targets = input_ids[:, 1:].clone()
+    for i, pl in enumerate(prompt_lens):
+        targets[i, : pl - 1] = -100             # ignore prompt tokens
+    return F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                           targets.reshape(-1), ignore_index=-100)
+</code></pre>
+<p>Data: tens of thousands to millions of examples, from human writers, from stronger models (<strong>distillation</strong>), and from filtered model outputs. InstructGPT used about 13,000 human demonstrations; the LIMA paper (2023) showed 1,000 very high-quality examples can go a long way. Quality and diversity matter more than volume.</p>
+<h2>Stage 2: Learning from preferences</h2>
+<p>Writing perfect answers is hard; <em>comparing</em> two answers is easy. Preference methods exploit that.</p>
+<h3>RLHF with a reward model and PPO</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    P[&quot;Prompt&quot;] --&gt; M[&quot;Policy model generates 2+ responses&quot;]
+    M --&gt; H[&quot;Humans rank: A better than B&quot;]
+    H --&gt; RM[&quot;Train reward model: r(prompt, response) → score&quot;]
+    RM --&gt; PPO[&quot;PPO: update policy to maximise reward&quot;]
+    REF[&quot;Frozen reference model (the SFT model)&quot;] --&gt; KL[&quot;KL penalty: don&#x27;t drift too far&quot;]
+    KL --&gt; PPO
+    PPO --&gt; M
+</pre>
+</figure>
+<ol>
+<li><strong>Reward model</strong>: a copy of the LLM with a scalar head, trained on pairwise comparisons using the <strong>Bradley–Terry</strong> loss: <code>−log σ(r(chosen) − r(rejected))</code>.</li>
+<li><strong>RL</strong>: the policy generates responses; the reward model scores them; <strong>PPO</strong> (proximal policy optimisation) updates the policy.</li>
+<li><strong>KL penalty</strong> against the SFT model stops <strong>reward hacking</strong>, where the policy finds outputs the reward model loves but humans do not (e.g., excessive length or flattery).</li>
+</ol>
+<p>PPO is infrastructure-heavy: four models in memory (policy, reference, reward, value/critic), and a generation phase inside the training loop. Frameworks like <strong>OpenRLHF</strong>, <strong>veRL</strong>, <strong>TRL</strong>, <strong>NeMo-RL</strong> and <strong>slime</strong> exist mainly to orchestrate that.</p>
+<h3>Direct Preference Optimisation (DPO)</h3>
+<p>DPO (2023) showed you can skip the reward model and RL loop entirely. It optimises the policy directly on preference pairs with a classification-style loss:</p>
+<div class="math">L = −log σ( β · [ log πθ(y_w|x)/π_ref(y_w|x) − log πθ(y_l|x)/π_ref(y_l|x) ] )</div>
+
+<p>where y_w is the preferred response and y_l the rejected one.</p>
+<pre><code class="language-python">def dpo_loss(pol_chosen_lp, pol_rejected_lp, ref_chosen_lp, ref_rejected_lp, beta=0.1):
+    # each argument: summed log-prob of the response tokens, shape (B,)
+    logits = beta * ((pol_chosen_lp - ref_chosen_lp) - (pol_rejected_lp - ref_rejected_lp))
+    return -F.logsigmoid(logits).mean()
+</code></pre>
+<p>DPO is simple and stable, and it became the default in open-source post-training. Variants: IPO, KTO (needs only thumbs-up/down), ORPO, SimPO.</p>
+<h2>Constitutional AI and AI feedback</h2>
+<p>Anthropic's <strong>Constitutional AI</strong> (2022) replaced much human harm-labelling with a written set of principles. The model critiques and revises its own outputs against the principles (supervised stage), then an AI judge produces preference labels (<strong>RLAIF</strong>). This scales feedback and makes the values being trained explicit. Most labs now use large amounts of AI-generated feedback, with humans auditing.</p>
+<h2>Stage 3: Reinforcement learning with verifiable rewards (RLVR)</h2>
+<p>The breakthrough of 2024–2025. For tasks where correctness can be <strong>checked automatically</strong> (math answers, code that passes unit tests, a web task that succeeds), you do not need a learned reward model. Generate many attempts, reward the correct ones, and reinforce.</p>
+<p><strong>GRPO</strong> (group relative policy optimisation, from DeepSeekMath 2024 and used in DeepSeek-R1) removes PPO's value network: sample a <em>group</em> of answers per prompt and use each answer's reward relative to the group average as its advantage.</p>
+<pre><code class="language-python">import torch
+
+def grpo_advantages(rewards):            # rewards: (num_prompts, group_size)
+    mean = rewards.mean(dim=1, keepdim=True)
+    std = rewards.std(dim=1, keepdim=True) + 1e-6
+    return (rewards - mean) / std
+
+def grpo_loss(logp_new, logp_old, adv, clip=0.2):
+    # per-token log-probs (B, T) for sampled responses; adv broadcast per response
+    ratio = (logp_new - logp_old).exp()
+    unclipped = ratio * adv
+    clipped = ratio.clamp(1 - clip, 1 + clip) * adv
+    return -torch.min(unclipped, clipped).mean()
+
+r = torch.tensor([[1., 0., 0., 1., 1., 0., 0., 0.]])   # 8 attempts, 3 correct
+print(grpo_advantages(r))                            # correct ones get positive advantage
+</code></pre>
+<p>What DeepSeek-R1-Zero showed (January 2025): applying this directly to a base model, with rewards only for correct final answers and correct format, caused the model to <strong>spontaneously learn to reason at length</strong>, check its work, and backtrack ("wait, let me reconsider"). Response length grew steadily during training. This is the recipe behind the reasoning models of Chapter 13.</p>
+<h3>The RL infrastructure problem</h3>
+<p>RL for LLMs alternates between <strong>generation</strong> (inference, often 70–90% of wall-clock time) and <strong>training</strong>. Modern systems:</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph Rollout[&quot;Rollout workers (vLLM / SGLang)&quot;]
+      G1[&quot;Generate many attempts per prompt&quot;]
+    end
+    subgraph Env[&quot;Environments and verifiers&quot;]
+      V1[&quot;Math checker&quot;]
+      V2[&quot;Code sandbox running tests&quot;]
+      V3[&quot;Browser / tool / agent tasks&quot;]
+    end
+    subgraph Trainer[&quot;Trainer (FSDP / Megatron)&quot;]
+      T1[&quot;Compute advantages, update weights&quot;]
+    end
+    G1 --&gt; Env
+    Env --&gt;|&quot;rewards&quot;| T1
+    T1 --&gt;|&quot;push new weights&quot;| G1
+</pre>
+</figure>
+<p>Hard problems: long-tail generation latency (a few very long responses stall the batch), fast weight synchronisation from trainer to inference engines, running thousands of secure code sandboxes, and <strong>asynchronous/off-policy</strong> RL to keep GPUs busy. Reward hacking is common: models learn to special-case unit tests or edit the test file. Environment design is now a core research and engineering discipline, and a startup category ("RL environments").</p>
+<h2>Distillation</h2>
+<p>A large "teacher" model generates outputs (or full probability distributions) and a small "student" trains on them. DeepSeek distilled R1's reasoning traces into Qwen and Llama models from 1.5B to 70B parameters, producing small models that reason far better than their size suggests. Most small commercial models are distilled from larger ones.</p>
+<h2>Model merging</h2>
+<p>Averaging or combining weights of fine-tuned variants (model soups, TIES, DARE, SLERP) can combine skills without further training. It is common in the open-model community and used by some labs between RL stages.</p>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project: Teach a small model a verifiable skill with GRPO</h3>
+<p><strong>Business problem:</strong> an operations team needs a cheap model that reliably extracts structured fields (dates, amounts, IDs) from messy emails into valid JSON. Frontier API calls cost too much at their volume.</p>
+<ol>
+<li>Start from a 0.5B–3B open instruct model.</li>
+<li>Build a verifier: reward 1.0 if the output parses as JSON matching the schema and fields match ground truth; partial credit per field.</li>
+<li>Run SFT on 1,000 examples, then GRPO with Hugging Face <strong>TRL</strong> (<code>GRPOTrainer</code>) or <strong>Unsloth</strong> on a single GPU.</li>
+<li>Compare: accuracy and cost per 1,000 emails vs. a frontier API. Watch for reward hacking (e.g., empty-but-valid JSON).</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Ouyang et al., <em>Training language models to follow instructions with human feedback</em> (InstructGPT, 2022).</li>
+<li>Rafailov et al., <em>Direct Preference Optimization</em> (2023).</li>
+<li>Bai et al., <em>Constitutional AI</em> (2022).</li>
+<li>DeepSeek-AI, <em>DeepSeek-R1</em> (2025); Shao et al., <em>DeepSeekMath</em> (2024, introduces GRPO).</li>
+<li>Nathan Lambert, <em>RLHF Book</em> (free online, rlhfbook.com).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

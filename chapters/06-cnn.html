@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Convolutional Networks and Computer Vision · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="6">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Convolutional Networks and Computer Vision</h1>
+<p class="lede">Convolutional networks started the deep learning revolution and taught the field how to build deep, trainable architectures. Today, vision Transformers and diffusion models have taken over much of vision, but the ideas here (locality, weight sharing, residual connections, pretraining then transfer) run through everything.</p>
+</header>
+
+<h2>Why not just use an MLP on pixels?</h2>
+<p>A 224×224 colour image has 150,528 numbers. A dense layer with 4,096 outputs would need 617 million weights for the first layer alone, and it would have to learn separately that a cat in the top-left is the same as a cat in the bottom-right. Images have structure an MLP ignores:</p>
+<ul>
+<li><strong>Locality</strong>: nearby pixels are related.</li>
+<li><strong>Translation equivariance</strong>: a pattern means the same thing wherever it appears.</li>
+</ul>
+<h2>The convolution</h2>
+<p>A <strong>convolution</strong> slides a small filter (say 3×3) across the image, computing a dot product at every position. The same filter weights are reused everywhere (<strong>weight sharing</strong>). A layer has many filters, each producing a <strong>feature map</strong> that lights up where its pattern appears.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Image 224x224x3&quot;] --&gt; B[&quot;Conv 3x3, 64 filters + ReLU&quot;]
+    B --&gt; C[&quot;Feature maps 224x224x64&quot;]
+    C --&gt; D[&quot;Pool / stride 2&quot;]
+    D --&gt; E[&quot;Conv layers: edges → textures → parts → objects&quot;]
+    E --&gt; F[&quot;Global average pool&quot;]
+    F --&gt; G[&quot;Linear → class scores&quot;]
+</pre>
+</figure>
+<p>Early layers learn edges and colour blobs; middle layers learn textures and parts (eyes, wheels); late layers learn whole objects. This hierarchy of learned features is the core insight of deep learning.</p>
+<p><strong>Output size</strong> of a conv: <code>(W − K + 2P) / S + 1</code>, for input width W, kernel K, padding P, stride S.</p>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class SmallCNN(nn.Module):
+    def __init__(self, n_classes=10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.MaxPool2d(2),                                  # 32x32 -&gt; 16x16
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.MaxPool2d(2),                                  # 16x16 -&gt; 8x8
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),                          # -&gt; 1x1
+        )
+        self.head = nn.Linear(128, n_classes)
+    def forward(self, x):
+        return self.head(self.features(x).flatten(1))
+
+x = torch.randn(8, 3, 32, 32)          # CIFAR-10 sized batch
+print(SmallCNN()(x).shape)             # torch.Size([8, 10])
+</code></pre>
+<h2>The landmark architectures</h2>
+<table>
+<thead>
+<tr>
+<th>Year</th>
+<th>Model</th>
+<th>Idea that stuck</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1998</td>
+<td>LeNet-5</td>
+<td>Conv + pool + dense; trained with backprop</td>
+</tr>
+<tr>
+<td>2012</td>
+<td>AlexNet</td>
+<td>GPUs, ReLU, dropout, data augmentation</td>
+</tr>
+<tr>
+<td>2014</td>
+<td>VGG</td>
+<td>Deep stacks of 3×3 convs</td>
+</tr>
+<tr>
+<td>2014</td>
+<td>GoogLeNet / Inception</td>
+<td>Parallel filter sizes; 1×1 convs to cut compute</td>
+</tr>
+<tr>
+<td>2015</td>
+<td><strong>ResNet</strong></td>
+<td>Residual connections; 152 layers</td>
+</tr>
+<tr>
+<td>2017</td>
+<td>MobileNet</td>
+<td>Depthwise-separable convs for phones</td>
+</tr>
+<tr>
+<td>2019</td>
+<td>EfficientNet</td>
+<td>Scale depth, width, resolution together</td>
+</tr>
+<tr>
+<td>2020</td>
+<td><strong>Vision Transformer (ViT)</strong></td>
+<td>Split image into 16×16 patches; treat patches as tokens</td>
+</tr>
+<tr>
+<td>2022</td>
+<td>ConvNeXt</td>
+<td>Modernised CNN that matches ViTs</td>
+</tr>
+</tbody>
+</table>
+<h2>ResNet: the idea that made depth work</h2>
+<p>Before ResNet, adding layers beyond about 20 made accuracy <em>worse</em>, even on training data: the optimiser could not find good solutions. ResNet made each block learn a <em>residual</em>: <code>output = x + F(x)</code>. If a layer is not useful, it can learn <code>F(x)=0</code> and pass the input through unchanged.</p>
+<pre><code class="language-python">class ResBlock(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(c, c, 3, padding=1), nn.BatchNorm2d(c), nn.ReLU(),
+            nn.Conv2d(c, c, 3, padding=1), nn.BatchNorm2d(c))
+    def forward(self, x):
+        return torch.relu(x + self.body(x))     # the skip connection
+</code></pre>
+<h2>Vision Transformers</h2>
+<p>ViT cuts an image into patches (e.g., 16×16 pixels), flattens each patch into a vector with a linear layer, adds position embeddings, and feeds the sequence into a standard Transformer. With enough data, ViTs beat CNNs, and they share infrastructure with language models, which is a large practical advantage. Most multimodal LLMs (Chapter 14) use a ViT-style image encoder.</p>
+<h2>Tasks beyond classification</h2>
+<ul>
+<li><strong>Object detection</strong>: find boxes around objects (YOLO family, DETR).</li>
+<li><strong>Segmentation</strong>: label every pixel (U-Net, Mask R-CNN, Meta's <strong>Segment Anything</strong>/SAM series).</li>
+<li><strong>Depth, pose, tracking, OCR</strong>, and document understanding.</li>
+<li><strong>Generation</strong>: GANs, then diffusion models (Chapter 14).</li>
+</ul>
+<h2>Transfer learning: the business pattern</h2>
+<p>Training from scratch is expensive. Instead, take a model <strong>pretrained</strong> on a large dataset and <strong>fine-tune</strong> it on your small one. This pattern (pretrain once at great cost, adapt cheaply many times) is exactly the economics of foundation models.</p>
+<pre><code class="language-python">import torchvision
+model = torchvision.models.resnet50(weights=&quot;IMAGENET1K_V2&quot;)
+for p in model.parameters():
+    p.requires_grad = False                    # freeze the backbone
+model.fc = nn.Linear(model.fc.in_features, 5)  # new head for 5 defect types
+# train only model.fc on a few hundred labelled images
+</code></pre>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project: Visual defect detection for a factory line</h3>
+<p><strong>Business problem:</strong> a manufacturer inspects parts by hand; inspectors miss defects late in shifts, and throughput is capped.</p>
+<ol>
+<li>Use the MVTec AD dataset (public industrial-defect images).</li>
+<li>Fine-tune a pretrained ResNet or a small ViT; compare with a zero-shot vision-language model prompted with "Is this part defective?".</li>
+<li>Export to ONNX, then measure latency on CPU and on a GPU with TensorRT.</li>
+<li>Report: recall on defects at a fixed false-alarm rate, and images per second per dollar. The line runs at 5 parts per second; can you keep up on a $300 edge device?</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Stanford <strong>CS231n</strong> lecture notes and videos.</li>
+<li>He et al., <em>Deep Residual Learning for Image Recognition</em> (2015).</li>
+<li>Dosovitskiy et al., <em>An Image is Worth 16x16 Words</em> (2020).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

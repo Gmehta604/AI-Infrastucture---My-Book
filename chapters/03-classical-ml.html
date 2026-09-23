@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Classical Machine Learning · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="3">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Classical Machine Learning</h1>
+<p class="lede">Before deep learning there was machine learning, and it never went away. Fraud detection, credit scoring, ad ranking, demand forecasting and churn prediction still run largely on the methods in this chapter. More importantly, the vocabulary here (training, validation, overfitting, metrics) is the vocabulary of all of AI.</p>
+</header>
+
+<h2>What "learning" means</h2>
+<p>A program <strong>learns</strong> when its performance on a task improves with experience (data). There are three main settings:</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    ML[&quot;Machine learning&quot;] --&gt; S[&quot;Supervised: labelled examples&quot;]
+    ML --&gt; U[&quot;Unsupervised: no labels&quot;]
+    ML --&gt; R[&quot;Reinforcement: rewards from actions&quot;]
+    S --&gt; S1[&quot;Regression: predict a number (house price)&quot;]
+    S --&gt; S2[&quot;Classification: predict a category (spam or not)&quot;]
+    U --&gt; U1[&quot;Clustering (customer segments)&quot;]
+    U --&gt; U2[&quot;Dimensionality reduction (PCA)&quot;]
+    U --&gt; U3[&quot;Self-supervised: predict hidden parts of data (LLM pretraining)&quot;]
+    R --&gt; R1[&quot;Games, robotics, RLHF, reasoning models&quot;]
+</pre>
+</figure>
+<p>LLM pretraining is <strong>self-supervised</strong>: the "label" is simply the next word, which comes free with the text. That is why it scales to trillions of examples without human labelling.</p>
+<h2>The workflow every ML project follows</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Define the problem and metric&quot;] --&gt; B[&quot;Collect and clean data&quot;]
+    B --&gt; C[&quot;Split: train / validation / test&quot;]
+    C --&gt; D[&quot;Engineer features&quot;]
+    D --&gt; E[&quot;Train model&quot;]
+    E --&gt; F[&quot;Evaluate on validation&quot;]
+    F --&gt;|&quot;not good enough&quot;| D
+    F --&gt;|&quot;good&quot;| G[&quot;Final check on test set&quot;]
+    G --&gt; H[&quot;Deploy and monitor&quot;]
+    H --&gt;|&quot;data drift&quot;| B
+</pre>
+</figure>
+<ul>
+<li><strong>Training set</strong>: the model learns from it.</li>
+<li><strong>Validation set</strong>: you tune choices (hyperparameters) against it.</li>
+<li><strong>Test set</strong>: touched once, at the end, to report honest performance.</li>
+</ul>
+<p>If you tune against the test set, you are fooling yourself. This is also the core problem with public LLM benchmarks: once they leak into training data, scores stop meaning much (Chapter 23).</p>
+<h2>Linear regression</h2>
+<p>Predict a number as a weighted sum of features: <code>ŷ = w·x + b</code>. Train by minimising <strong>mean squared error</strong>.</p>
+<pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+X = rng.uniform(0, 10, size=(200, 1))
+y = 3.0 * X[:, 0] + 5 + rng.normal(0, 1, 200)      # true w=3, b=5
+
+w, b, lr = 0.0, 0.0, 0.01
+for epoch in range(2000):
+    pred = w * X[:, 0] + b
+    err = pred - y
+    w -= lr * (2 * err * X[:, 0]).mean()           # dMSE/dw
+    b -= lr * (2 * err).mean()                     # dMSE/db
+print(f&quot;w={w:.2f}  b={b:.2f}&quot;)                     # ≈ 3.00, 5.0
+</code></pre>
+<p>Notice that this is exactly the gradient-descent loop from Chapter 2. A neural network is this loop with a more complicated function.</p>
+<h2>Logistic regression: the ancestor of every classifier</h2>
+<p>For classification, pass the weighted sum through a <strong>sigmoid</strong> to get a probability between 0 and 1, and train with <strong>cross-entropy</strong> loss. The final layer of an LLM is essentially a giant multi-class logistic regression over ~100,000–250,000 tokens (softmax instead of sigmoid).</p>
+<pre><code class="language-python">from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
+X, y = load_breast_cancer(return_X_y=True)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=0)
+clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+clf.fit(Xtr, ytr)
+print(&quot;accuracy:&quot;, clf.score(Xte, yte))
+</code></pre>
+<h2>Decision trees, random forests, gradient boosting</h2>
+<p>A <strong>decision tree</strong> asks a sequence of yes/no questions ("income &gt; 50k?"). Trees are interpretable but overfit easily.</p>
+<ul>
+<li><strong>Random forest</strong>: train hundreds of trees on random subsets of rows and features, then average. Averaging cancels out individual trees' errors (this is <strong>bagging</strong>).</li>
+<li><strong>Gradient boosting</strong> (XGBoost, LightGBM, CatBoost): train trees <em>sequentially</em>, each one correcting the errors of the ones before. For tabular data (spreadsheets, databases), gradient boosting is still usually the best method in 2026, often beating deep learning.</li>
+</ul>
+<pre><code class="language-python">from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+for model in [RandomForestClassifier(n_estimators=300), HistGradientBoostingClassifier()]:
+    model.fit(Xtr, ytr)
+    print(type(model).__name__, model.score(Xte, yte))
+</code></pre>
+<h2>Unsupervised learning</h2>
+<ul>
+<li><strong>k-means clustering</strong>: pick k centres, assign each point to the nearest, move centres to the mean, repeat. Used in vector databases (IVF indexes, Chapter 21) and in quantization codebooks.</li>
+<li><strong>PCA</strong>: find the directions along which data varies most, and project onto the top few. Used for visualisation and compression.</li>
+</ul>
+<pre><code class="language-python">from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+X2 = PCA(n_components=2).fit_transform(X)
+labels = KMeans(n_clusters=2, n_init=10).fit_predict(X2)
+</code></pre>
+<h2>Overfitting, underfitting and the bias–variance trade-off</h2>
+<ul>
+<li><strong>Underfitting (high bias)</strong>: the model is too simple; it is bad on training <em>and</em> validation data.</li>
+<li><strong>Overfitting (high variance)</strong>: the model memorised the training data; it is great on training data and bad on validation.</li>
+</ul>
+<p>Cures for overfitting: more data, <strong>regularisation</strong> (L2 penalty on weights, called <em>weight decay</em> in deep learning), <strong>dropout</strong>, <strong>early stopping</strong>, simpler models.</p>
+<p>Deep learning complicated this story. Very large networks trained on enough data show <strong>double descent</strong>: past a certain size, test error falls again as models grow. Huge LLMs are trained for about one pass (one "epoch") over their data, so classical overfitting is rare in pretraining. It returns with a vengeance in fine-tuning on small datasets (Chapter 18).</p>
+<h2>Metrics: choose them before you train</h2>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Metric</th>
+<th>When it misleads</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Classification</td>
+<td>Accuracy</td>
+<td>Imbalanced data (99% "not fraud" gives 99% accuracy with a useless model)</td>
+</tr>
+<tr>
+<td>Classification</td>
+<td>Precision = TP/(TP+FP)</td>
+<td>Ignores what you missed</td>
+</tr>
+<tr>
+<td>Classification</td>
+<td>Recall = TP/(TP+FN)</td>
+<td>Ignores false alarms</td>
+</tr>
+<tr>
+<td>Classification</td>
+<td>F1, ROC-AUC, PR-AUC</td>
+<td>PR-AUC is better for rare positives</td>
+</tr>
+<tr>
+<td>Regression</td>
+<td>MAE, RMSE</td>
+<td>RMSE punishes large errors more</td>
+</tr>
+<tr>
+<td>Ranking / search</td>
+<td>NDCG, MRR, Recall@k</td>
+<td>Used for RAG retrieval (Chapter 21)</td>
+</tr>
+<tr>
+<td>Language models</td>
+<td>Perplexity, pass@k, win rate</td>
+<td>Covered in Chapter 23</td>
+</tr>
+</tbody>
+</table>
+<div class="callout"><p><strong>Key idea.</strong> The metric <em>is</em> the business problem. A fraud model that catches 95% of fraud but flags 10% of legitimate customers may cost more than it saves. Always translate metrics into money or user impact.</p></div>
+<h2>Feature engineering vs. representation learning</h2>
+<p>In classical ML, humans design features (e.g., "number of transactions in the last hour"). Deep learning's promise is that the network <strong>learns the features itself</strong> from raw data (pixels, characters). That shift, from hand-crafted to learned representations, is the reason deep learning won in vision, speech and language, and why embeddings (Chapter 8) are so central.</p>
+<h2>Where classical ML lives in the modern stack</h2>
+<ul>
+<li>Ranking and recommendation systems at Meta, Google, TikTok, Amazon (often deep models, with gradient-boosted trees in parts of the pipeline).</li>
+<li><strong>LLM routers</strong> (Chapter 20) are frequently a small classifier deciding which model gets a request.</li>
+<li>Anomaly detection on GPU cluster telemetry (predicting failing nodes).</li>
+<li>Eval classifiers that score LLM outputs for toxicity or PII.</li>
+</ul>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project 0: A churn model with a cost-aware threshold</h3>
+<p><strong>Business problem:</strong> a subscription company loses customers and wants to target retention offers.</p>
+<ol>
+<li>Take a public churn dataset (e.g., the Telco Customer Churn dataset on Kaggle).</li>
+<li>Train logistic regression and LightGBM. Compare ROC-AUC.</li>
+<li>Assign costs: a retention offer costs $20; a lost customer costs $300. Choose the probability threshold that <strong>maximises profit</strong>, not accuracy.</li>
+<li>Write a one-page memo: "At threshold X we contact Y% of customers and save $Z per month."</li>
+</ol>
+<p>This teaches the discipline every later project needs: a metric tied to money.</p>
+</div>
+<h2>Resources</h2>
+<ul>
+<li><em>An Introduction to Statistical Learning</em> (James, Witten, Hastie, Tibshirani), free PDF with Python labs.</li>
+<li>Andrew Ng's <em>Machine Learning Specialization</em> (Coursera / DeepLearning.AI).</li>
+<li>scikit-learn user guide, which doubles as an excellent textbook.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

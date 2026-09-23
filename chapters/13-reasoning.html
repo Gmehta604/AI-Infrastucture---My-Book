@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reasoning Models and Test-Time Compute · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="13">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Reasoning Models and Test-Time Compute</h1>
+<p class="lede">In September 2024, OpenAI's o1 showed that letting a model "think" before answering, spending thousands of tokens on a hidden chain of thought, dramatically improves math, science and coding. By 2026, nearly every frontier model is a reasoning model with adjustable thinking effort. This changes the economics of inference completely.</p>
+</header>
+
+<h2>From chain-of-thought prompting to trained reasoning</h2>
+<p><strong>2022: chain-of-thought prompting.</strong> Wei et al. showed that adding "Let's think step by step" or worked examples made large models far better at multi-step problems. Writing intermediate steps gives the model more computation (more forward passes) and a scratchpad.</p>
+<p><strong>2022–23: self-consistency and search.</strong> Sample many reasoning chains and take the majority answer. Tree-of-Thoughts explores branches. These help but are bolted on.</p>
+<p><strong>2024–25: reasoning trained by RL.</strong> o1, then DeepSeek-R1, Gemini Thinking, Claude's extended thinking, Qwen QwQ/Qwen3, and others trained models with reinforcement learning (Chapter 12) to produce long, self-correcting reasoning before a final answer. The model learns <em>when</em> to verify, backtrack, try another approach, or decompose a problem.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    Q[&quot;Question&quot;] --&gt; T[&quot;Thinking tokens (hidden or summarised): plan, attempt, check, &#x27;wait...&#x27;, retry&quot;]
+    T --&gt; A[&quot;Final answer&quot;]
+    T -.-&gt;|&quot;more tokens = more compute = higher accuracy (up to a point)&quot;| A
+</pre>
+</figure>
+<h2>Test-time scaling</h2>
+<p>The key empirical finding: accuracy increases roughly <strong>log-linearly with thinking tokens</strong>. You can buy capability at inference time rather than only at training time.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>How it spends compute</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Longer single chain</td>
+<td>More thinking tokens</td>
+<td>Main mechanism in reasoning models; controlled by "effort" or a thinking budget</td>
+</tr>
+<tr>
+<td>Parallel sampling + vote</td>
+<td>N independent answers, majority wins</td>
+<td>Simple; good for short answers</td>
+</tr>
+<tr>
+<td>Best-of-N with a verifier</td>
+<td>N answers, a reward model or test suite picks one</td>
+<td>Great for code (run tests)</td>
+</tr>
+<tr>
+<td>Parallel thinking / multi-agent</td>
+<td>Several reasoning threads that share findings</td>
+<td>Used in "heavy"/"deep think" modes of 2025–26 products</td>
+</tr>
+<tr>
+<td>Tree search</td>
+<td>Explore branches with a value model</td>
+<td>Research; strong for math proofs</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-python">from collections import Counter
+
+def self_consistency(ask_model, question, n=8):
+    answers = [extract_final_answer(ask_model(question, temperature=0.8)) for _ in range(n)]
+    best, votes = Counter(answers).most_common(1)[0]
+    return best, votes / n            # answer and a confidence estimate
+
+def best_of_n_code(ask_model, task, tests, n=8):
+    for _ in range(n):
+        code = ask_model(task, temperature=0.8)
+        if run_tests_in_sandbox(code, tests):
+            return code
+    return None
+</code></pre>
+<h2>What reasoning did to the industry</h2>
+<ol>
+<li><strong>Inference became the dominant cost.</strong> A reasoning answer might use 5,000–50,000 tokens instead of 500. Agents that run for hours use millions. This is why 2025–26 hardware (Blackwell Ultra, Rubin, Rubin CPX, Groq-style LPUs) and software (disaggregated serving, Dynamo) focus on inference throughput and long-context decode.</li>
+<li><strong>Latency became a product decision.</strong> APIs expose effort levels (low/medium/high/max) or thinking budgets. Routers (Chapter 20) decide when a query deserves deep thought.</li>
+<li><strong>Benchmarks were rapidly saturated.</strong> AIME math, GPQA science and SWE-bench coding went from hard to near-solved in about 18 months. New benchmarks (Humanity's Last Exam, FrontierMath tiers, ARC-AGI-2/3, long-horizon agent tasks) keep appearing.</li>
+<li><strong>Hidden reasoning raised safety questions.</strong> Can we trust and monitor what a model thinks? Research on <strong>chain-of-thought faithfulness and monitorability</strong> asks whether visible reasoning reflects the real computation (Chapter 27).</li>
+</ol>
+<h2>Controlling reasoning via APIs</h2>
+<pre><code class="language-python"># Anthropic Messages API: extended thinking with a budget
+import anthropic
+client = anthropic.Anthropic()
+resp = client.messages.create(
+    model=&quot;claude-opus-5-5&quot;,           # use the current model id from the docs
+    max_tokens=16000,
+    thinking={&quot;type&quot;: &quot;enabled&quot;, &quot;budget_tokens&quot;: 8000},
+    messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;How many primes are below 10,000? Show a method.&quot;}],
+)
+for block in resp.content:
+    print(block.type)                  # 'thinking' then 'text'
+
+# OpenAI Responses API: reasoning effort
+from openai import OpenAI
+out = OpenAI().responses.create(
+    model=&quot;gpt-5.5&quot;,                   # check current model names
+    reasoning={&quot;effort&quot;: &quot;high&quot;},
+    input=&quot;Prove that the square root of 2 is irrational.&quot;,
+)
+print(out.output_text)
+</code></pre>
+<p>Parameter names change between API versions, so treat these as the shape of the idea and check the current documentation.</p>
+<h2>Why RL produces reasoning (intuition)</h2>
+<p>During RL on verifiable problems, a response that happens to double-check its arithmetic is more often correct, so it receives more reward, so the behaviour of double-checking is reinforced. Over thousands of steps, useful strategies (decomposition, verification, backtracking) are selected and lengthened. Nobody writes these strategies down; they are discovered, like AlphaGo's moves. That is the "bitter lesson" again: general methods plus compute beat hand-designed reasoning.</p>
+<h2>Limits and open problems</h2>
+<ul>
+<li><strong>Overthinking:</strong> models spend thousands of tokens on trivial questions. Adaptive thinking and length penalties help.</li>
+<li><strong>Verifiability gap:</strong> RL works best where answers can be checked. Extending to open-ended tasks (writing, strategy, research taste) relies on rubric-based rewards and LLM judges, which can be gamed.</li>
+<li><strong>Long-horizon agency:</strong> thinking for minutes is solved; working reliably for days on a project is the 2026 frontier, measured by task-length metrics like METR's "time horizon," which has been doubling roughly every 4–7 months.</li>
+</ul>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project: A "thinking budget" router that cuts cost without hurting accuracy</h3>
+<p><strong>Business problem:</strong> a support-automation company switched to a reasoning model and its bill tripled. Most tickets are easy.</p>
+<ol>
+<li>Collect 500 representative queries with correct answers.</li>
+<li>Run each at effort low, medium and high (or thinking budgets of 0, 2k, 8k tokens). Record accuracy, tokens and latency.</li>
+<li>Train a small classifier (Chapter 3) on query features or embeddings to predict the lowest effort that still answers correctly.</li>
+<li>Report the cost–accuracy curve: "Router saves 58% of spend at a 0.5-point accuracy loss."</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Wei et al., <em>Chain-of-Thought Prompting Elicits Reasoning in Large Language Models</em> (2022).</li>
+<li>OpenAI, <em>Learning to Reason with LLMs</em> (o1 announcement, 2024).</li>
+<li>DeepSeek-AI, <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via RL</em> (2025).</li>
+<li>Snell et al., <em>Scaling LLM Test-Time Compute Optimally Can Be More Effective than Scaling Model Parameters</em> (2024).</li>
+<li>METR, <em>Measuring AI Ability to Complete Long Tasks</em> (2025).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

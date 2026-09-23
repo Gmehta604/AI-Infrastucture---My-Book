@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Glossary · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="30">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Glossary</h1>
+<p class="lede">Quick definitions of the terms used throughout the book, with the chapter where each is explained in depth.</p>
+</header>
+
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+<th>Ch.</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Activation</strong></td>
+<td>Intermediate output of a layer; must be stored for the backward pass</td>
+<td>4</td>
+</tr>
+<tr>
+<td><strong>Activation checkpointing</strong></td>
+<td>Discard activations and recompute them during backward to save memory</td>
+<td>4, 17</td>
+</tr>
+<tr>
+<td><strong>AdamW</strong></td>
+<td>Adaptive optimizer with decoupled weight decay; the LLM default</td>
+<td>5</td>
+</tr>
+<tr>
+<td><strong>Agent</strong></td>
+<td>A model running in a loop that calls tools and acts toward a goal</td>
+<td>22</td>
+</tr>
+<tr>
+<td><strong>All-reduce / all-gather / reduce-scatter / all-to-all</strong></td>
+<td>Collective communication operations across GPUs</td>
+<td>17</td>
+</tr>
+<tr>
+<td><strong>Arithmetic intensity</strong></td>
+<td>FLOPs per byte of memory moved; decides compute- vs memory-bound</td>
+<td>15</td>
+</tr>
+<tr>
+<td><strong>Attention</strong></td>
+<td>Mechanism where each token takes a weighted mix of other tokens' values</td>
+<td>7, 9</td>
+</tr>
+<tr>
+<td><strong>AWQ / GPTQ</strong></td>
+<td>4-bit weight quantization methods</td>
+<td>19</td>
+</tr>
+<tr>
+<td><strong>Backpropagation</strong></td>
+<td>Chain-rule algorithm computing all gradients in one backward sweep</td>
+<td>4</td>
+</tr>
+<tr>
+<td><strong>BF16</strong></td>
+<td>16-bit float with FP32's range; standard training format</td>
+<td>2</td>
+</tr>
+<tr>
+<td><strong>BM25</strong></td>
+<td>Classic keyword relevance scoring for search</td>
+<td>21</td>
+</tr>
+<tr>
+<td><strong>BPE</strong></td>
+<td>Byte-pair encoding tokenizer</td>
+<td>8</td>
+</tr>
+<tr>
+<td><strong>Chinchilla scaling</strong></td>
+<td>Compute-optimal training uses ~20 tokens per parameter</td>
+<td>10</td>
+</tr>
+<tr>
+<td><strong>Continuous batching</strong></td>
+<td>Adding and removing sequences from a batch at every decode step</td>
+<td>19</td>
+</tr>
+<tr>
+<td><strong>Context parallelism</strong></td>
+<td>Splitting a long sequence across GPUs for attention</td>
+<td>17</td>
+</tr>
+<tr>
+<td><strong>CUDA</strong></td>
+<td>NVIDIA's GPU programming platform</td>
+<td>16</td>
+</tr>
+<tr>
+<td><strong>CUDA graphs</strong></td>
+<td>Record and replay kernel launches to remove CPU overhead</td>
+<td>16</td>
+</tr>
+<tr>
+<td><strong>Decode</strong></td>
+<td>Generating output one token at a time; memory-bandwidth-bound</td>
+<td>19</td>
+</tr>
+<tr>
+<td><strong>Diffusion model</strong></td>
+<td>Generative model that learns to reverse a noising process</td>
+<td>14</td>
+</tr>
+<tr>
+<td><strong>Disaggregated serving</strong></td>
+<td>Running prefill and decode on separate GPU pools</td>
+<td>19</td>
+</tr>
+<tr>
+<td><strong>Distillation</strong></td>
+<td>Training a small student model on a large teacher's outputs</td>
+<td>12</td>
+</tr>
+<tr>
+<td><strong>DPO</strong></td>
+<td>Direct Preference Optimization; preference tuning without RL</td>
+<td>12</td>
+</tr>
+<tr>
+<td><strong>Embedding</strong></td>
+<td>A learned vector representing a token, text, image or item</td>
+<td>8</td>
+</tr>
+<tr>
+<td><strong>Expert parallelism</strong></td>
+<td>Placing MoE experts on different GPUs</td>
+<td>17</td>
+</tr>
+<tr>
+<td><strong>FlashAttention</strong></td>
+<td>IO-aware attention kernel that never materialises the full score matrix</td>
+<td>16</td>
+</tr>
+<tr>
+<td><strong>FLOPs</strong></td>
+<td>Floating-point operations (FLOP/s = per second)</td>
+<td>2</td>
+</tr>
+<tr>
+<td><strong>FP8 / FP4 / NVFP4 / MXFP4</strong></td>
+<td>Low-precision number formats with block scaling</td>
+<td>2, 16</td>
+</tr>
+<tr>
+<td><strong>FSDP / ZeRO</strong></td>
+<td>Sharding weights, gradients and optimizer state across data-parallel GPUs</td>
+<td>17</td>
+</tr>
+<tr>
+<td><strong>GEMM</strong></td>
+<td>General matrix multiply; the core operation of deep learning</td>
+<td>2, 16</td>
+</tr>
+<tr>
+<td><strong>Goodput</strong></td>
+<td>Useful throughput: training progress or requests that meet SLOs</td>
+<td>10, 19</td>
+</tr>
+<tr>
+<td><strong>GQA / MQA / MLA</strong></td>
+<td>Attention variants that shrink the KV cache</td>
+<td>9</td>
+</tr>
+<tr>
+<td><strong>GRPO</strong></td>
+<td>Group Relative Policy Optimization; RL without a value network</td>
+<td>12</td>
+</tr>
+<tr>
+<td><strong>Hallucination</strong></td>
+<td>Fluent but false or unsupported model output</td>
+<td>21</td>
+</tr>
+<tr>
+<td><strong>HBM</strong></td>
+<td>High-bandwidth memory stacked next to the GPU die</td>
+<td>15</td>
+</tr>
+<tr>
+<td><strong>HNSW</strong></td>
+<td>Graph-based approximate nearest-neighbour index</td>
+<td>21</td>
+</tr>
+<tr>
+<td><strong>KV cache</strong></td>
+<td>Stored keys and values of past tokens, reused during decoding</td>
+<td>9, 19</td>
+</tr>
+<tr>
+<td><strong>LLM-as-judge</strong></td>
+<td>Using a model to grade outputs against a rubric</td>
+<td>23</td>
+</tr>
+<tr>
+<td><strong>LoRA / QLoRA</strong></td>
+<td>Low-rank adapters for efficient fine-tuning (QLoRA: on a 4-bit base)</td>
+<td>18</td>
+</tr>
+<tr>
+<td><strong>MCP</strong></td>
+<td>Model Context Protocol; standard for connecting models to tools and data</td>
+<td>22</td>
+</tr>
+<tr>
+<td><strong>MFU</strong></td>
+<td>Model FLOPs utilisation: useful FLOP/s ÷ hardware peak</td>
+<td>10, 17</td>
+</tr>
+<tr>
+<td><strong>MoE</strong></td>
+<td>Mixture of experts; sparse layers where each token uses a few experts</td>
+<td>11</td>
+</tr>
+<tr>
+<td><strong>NCCL</strong></td>
+<td>NVIDIA's collective communication library</td>
+<td>17</td>
+</tr>
+<tr>
+<td><strong>NVLink / NVSwitch</strong></td>
+<td>NVIDIA's high-bandwidth GPU-to-GPU interconnect</td>
+<td>15</td>
+</tr>
+<tr>
+<td><strong>PagedAttention</strong></td>
+<td>Storing the KV cache in fixed-size blocks, like virtual memory</td>
+<td>19</td>
+</tr>
+<tr>
+<td><strong>Perplexity</strong></td>
+<td>exp(average cross-entropy); lower is better</td>
+<td>2</td>
+</tr>
+<tr>
+<td><strong>Pipeline parallelism</strong></td>
+<td>Splitting layers across GPUs and streaming micro-batches</td>
+<td>17</td>
+</tr>
+<tr>
+<td><strong>Prefill</strong></td>
+<td>Processing the prompt in parallel; compute-bound</td>
+<td>19</td>
+</tr>
+<tr>
+<td><strong>Prefix / prompt caching</strong></td>
+<td>Reusing KV cache for shared prompt prefixes</td>
+<td>19</td>
+</tr>
+<tr>
+<td><strong>Prompt injection</strong></td>
+<td>Malicious instructions in content an AI system reads</td>
+<td>22, 27</td>
+</tr>
+<tr>
+<td><strong>PUE</strong></td>
+<td>Power usage effectiveness of a data center</td>
+<td>25</td>
+</tr>
+<tr>
+<td><strong>Quantization</strong></td>
+<td>Representing weights/activations with fewer bits</td>
+<td>19</td>
+</tr>
+<tr>
+<td><strong>RAG</strong></td>
+<td>Retrieval-augmented generation</td>
+<td>21</td>
+</tr>
+<tr>
+<td><strong>Reranker</strong></td>
+<td>Cross-encoder that rescores retrieved candidates</td>
+<td>21</td>
+</tr>
+<tr>
+<td><strong>Residual connection</strong></td>
+<td>x + f(x); lets gradients flow through deep networks</td>
+<td>5, 6</td>
+</tr>
+<tr>
+<td><strong>RLHF / RLAIF / RLVR</strong></td>
+<td>RL from human feedback / AI feedback / verifiable rewards</td>
+<td>12</td>
+</tr>
+<tr>
+<td><strong>RMSNorm</strong></td>
+<td>Normalisation by root-mean-square; used in modern LLMs</td>
+<td>5</td>
+</tr>
+<tr>
+<td><strong>Roofline model</strong></td>
+<td>Performance bound from peak compute and memory bandwidth</td>
+<td>15</td>
+</tr>
+<tr>
+<td><strong>RoPE</strong></td>
+<td>Rotary position embedding</td>
+<td>8, 9</td>
+</tr>
+<tr>
+<td><strong>Scaling laws</strong></td>
+<td>Power-law relations between loss and compute, data, parameters</td>
+<td>10</td>
+</tr>
+<tr>
+<td><strong>SFT</strong></td>
+<td>Supervised fine-tuning on demonstrations</td>
+<td>12</td>
+</tr>
+<tr>
+<td><strong>Softmax</strong></td>
+<td>Converts scores into a probability distribution</td>
+<td>2</td>
+</tr>
+<tr>
+<td><strong>Sparse autoencoder</strong></td>
+<td>Tool that decomposes activations into interpretable features</td>
+<td>27</td>
+</tr>
+<tr>
+<td><strong>Speculative decoding</strong></td>
+<td>Draft-and-verify decoding that emits several tokens per big-model step</td>
+<td>19</td>
+</tr>
+<tr>
+<td><strong>SSM / linear attention</strong></td>
+<td>Recurrent-style layers with fixed-size state (Mamba, Gated DeltaNet)</td>
+<td>11</td>
+</tr>
+<tr>
+<td><strong>SwiGLU</strong></td>
+<td>Gated feed-forward activation used in modern LLMs</td>
+<td>4, 9</td>
+</tr>
+<tr>
+<td><strong>Tensor Core</strong></td>
+<td>GPU unit that performs small matrix multiplies in one instruction</td>
+<td>15</td>
+</tr>
+<tr>
+<td><strong>Tensor parallelism</strong></td>
+<td>Splitting each weight matrix across GPUs</td>
+<td>17</td>
+</tr>
+<tr>
+<td><strong>Test-time compute</strong></td>
+<td>Spending more inference tokens (thinking, sampling) for better answers</td>
+<td>13</td>
+</tr>
+<tr>
+<td><strong>Token</strong></td>
+<td>Unit of text a model processes (a subword)</td>
+<td>8</td>
+</tr>
+<tr>
+<td><strong>TPOT / TTFT</strong></td>
+<td>Time per output token / time to first token</td>
+<td>19</td>
+</tr>
+<tr>
+<td><strong>Triton</strong></td>
+<td>Python-based language for writing GPU kernels</td>
+<td>16</td>
+</tr>
+<tr>
+<td><strong>vLLM / SGLang / TensorRT-LLM</strong></td>
+<td>Leading LLM serving engines</td>
+<td>19</td>
+</tr>
+</tbody>
+</table>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

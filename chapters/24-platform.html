@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The AI Platform: Kubernetes, Schedulers and MLOps · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="24">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>The AI Platform: Kubernetes, Schedulers and MLOps</h1>
+<p class="lede">Individual models and services need a platform underneath: something that allocates scarce GPUs fairly, deploys and scales model servers, runs training jobs, tracks experiments and models, and keeps costs visible. This is the day job of most "ML platform" and "AI infrastructure" engineers.</p>
+</header>
+
+<h2>The platform map</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    subgraph Users
+      R[&quot;Researchers&quot;]
+      A[&quot;App teams&quot;]
+    end
+    subgraph Platform[&quot;AI platform&quot;]
+      NB[&quot;Notebooks / dev pods&quot;]
+      TJ[&quot;Training jobs (Kubeflow Trainer, Ray, Slurm)&quot;]
+      EX[&quot;Experiment tracking (W&amp;B, MLflow)&quot;]
+      REG[&quot;Model registry and artifact store&quot;]
+      SRV[&quot;Model serving (KServe, Ray Serve, vLLM, llm-d)&quot;]
+      GW[&quot;LLM gateway (Chapter 20)&quot;]
+      OBS[&quot;Observability and cost dashboards&quot;]
+    end
+    subgraph Infra[&quot;Infrastructure&quot;]
+      K8S[&quot;Kubernetes / Slurm&quot;]
+      SCH[&quot;GPU scheduling: Kueue, Volcano, Run:ai&quot;]
+      GPU[&quot;GPU nodes + NVIDIA GPU Operator&quot;]
+      NET[&quot;InfiniBand / RoCE&quot;]
+      STO[&quot;Storage: object store, parallel FS (Lustre, Weka, VAST)&quot;]
+    end
+    R --&gt; NB &amp; TJ
+    A --&gt; GW --&gt; SRV
+    TJ --&gt; EX --&gt; REG --&gt; SRV
+    Platform --&gt; Infra
+</pre>
+</figure>
+<h2>Slurm vs Kubernetes</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Slurm</th>
+<th>Kubernetes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Origin</td>
+<td>HPC / supercomputers</td>
+<td>Web services</td>
+</tr>
+<tr>
+<td>Strength</td>
+<td>Gang scheduling large multi-node jobs, topology-aware placement</td>
+<td>Services, autoscaling, ecosystem, multi-tenancy</td>
+</tr>
+<tr>
+<td>Typical use</td>
+<td>Large pretraining runs at labs and neoclouds</td>
+<td>Inference, fine-tuning, pipelines, mixed workloads</td>
+</tr>
+<tr>
+<td>Trend</td>
+<td>Slurm-on-Kubernetes (e.g., SUNK, Slinky) to get both</td>
+<td>Kueue, JobSet, LeaderWorkerSet adding HPC-style features</td>
+</tr>
+</tbody>
+</table>
+<h2>GPUs on Kubernetes</h2>
+<ol>
+<li><strong>NVIDIA GPU Operator</strong> installs drivers, the container toolkit, the device plugin (so pods can request <code>nvidia.com/gpu</code>), DCGM exporter for metrics, and the network operator for RDMA.</li>
+<li><strong>Dynamic Resource Allocation (DRA)</strong>, stable in recent Kubernetes versions, gives richer GPU requests (specific models, partitions, topology).</li>
+<li><strong>Sharing:</strong> MIG (Multi-Instance GPU) splits an A100/H100/B200 into isolated slices; time-slicing and MPS share without isolation. Good for small models and notebooks.</li>
+<li><strong>Queueing and fairness:</strong> <strong>Kueue</strong> or <strong>Volcano</strong> provide quotas per team, gang scheduling (all pods of a distributed job start together or none do), preemption and borrowing of idle quota.</li>
+</ol>
+<pre><code class="language-yaml"># A vLLM deployment requesting one GPU
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: qwen-7b }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: qwen-7b } }
+  template:
+    metadata: { labels: { app: qwen-7b } }
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          args: [&quot;--model&quot;, &quot;Qwen/Qwen2.5-7B-Instruct&quot;, &quot;--max-model-len&quot;, &quot;16384&quot;,
+                 &quot;--enable-prefix-caching&quot;, &quot;--gpu-memory-utilization&quot;, &quot;0.9&quot;]
+          ports: [{ containerPort: 8000 }]
+          resources:
+            limits: { nvidia.com/gpu: 1 }
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 60
+          volumeMounts: [{ name: cache, mountPath: /root/.cache/huggingface }]
+      volumes:
+        - name: cache
+          persistentVolumeClaim: { claimName: hf-model-cache }
+</code></pre>
+<h2>Autoscaling model servers</h2>
+<p>CPU-based autoscaling is useless for LLM servers; scale on signals that reflect load:</p>
+<ul>
+<li><strong>Queue depth / pending requests</strong> (e.g., vLLM's <code>vllm:num_requests_waiting</code>).</li>
+<li><strong>KV cache utilisation</strong> (<code>vllm:gpu_cache_usage_perc</code> or equivalent).</li>
+<li><strong>Latency SLO</strong> (p95 TTFT approaching the limit).</li>
+</ul>
+<p>Tools: KEDA (event-driven autoscaling from Prometheus metrics), Knative/KServe (with <strong>scale-to-zero</strong>), Ray Serve autoscaling, and the Kubernetes Gateway API Inference Extension for model-aware load balancing.</p>
+<pre><code class="language-yaml"># KEDA: scale on waiting requests, down to zero at night
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: { name: qwen-7b-scaler }
+spec:
+  scaleTargetRef: { name: qwen-7b }
+  minReplicaCount: 0
+  maxReplicaCount: 8
+  cooldownPeriod: 600
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        query: sum(vllm:num_requests_waiting{app=&quot;qwen-7b&quot;})
+        threshold: &quot;10&quot;
+</code></pre>
+<h3>The cold-start problem</h3>
+<p>Scale-to-zero saves money, but a new replica must pull a multi-GB container image, download tens or hundreds of GB of weights, load them into GPU memory and warm up (compile CUDA graphs). That can take minutes. Fixes:</p>
+<ul>
+<li>Cache weights on local NVMe or a fast shared filesystem; pre-pull images.</li>
+<li>Stream weights directly into GPU memory (e.g., Run:ai Model Streamer, fastsafetensors).</li>
+<li>GPU memory snapshotting and restore (CUDA checkpoint, CRIU-based approaches used by serverless GPU platforms such as Modal).</li>
+<li>Keep a small warm pool; scale to zero only for rarely-used models.</li>
+</ul>
+<h2>Load balancing LLM traffic</h2>
+<p>Round-robin is bad for LLMs: requests differ wildly in cost, and routing a request to the replica that already has its prefix cached saves prefill. <strong>KV-cache-aware routing</strong> (llm-d, NVIDIA Dynamo, SGLang router, the Gateway API Inference Extension) scores replicas by cache overlap and current load.</p>
+<h2>MLOps building blocks</h2>
+<table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Tools</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Experiment tracking</td>
+<td>Weights &amp; Biases, MLflow, Neptune, Comet</td>
+</tr>
+<tr>
+<td>Pipelines / orchestration</td>
+<td>Kubeflow Pipelines, Airflow, Dagster, Prefect, Flyte, Metaflow</td>
+</tr>
+<tr>
+<td>Distributed compute</td>
+<td>Ray (train, tune, serve, data), Spark</td>
+</tr>
+<tr>
+<td>Model registry / artifacts</td>
+<td>MLflow registry, W&amp;B, Hugging Face Hub (private), object storage</td>
+</tr>
+<tr>
+<td>Feature stores (classical ML)</td>
+<td>Feast, Tecton, Databricks</td>
+</tr>
+<tr>
+<td>Data versioning</td>
+<td>DVC, lakeFS, Delta Lake / Iceberg</td>
+</tr>
+<tr>
+<td>Infrastructure as code</td>
+<td>Terraform, Pulumi, Helm, Argo CD</td>
+</tr>
+</tbody>
+</table>
+<h2>Where GPUs come from</h2>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Examples</th>
+<th>Trade-offs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hyperscalers</td>
+<td>AWS, Azure, Google Cloud, Oracle</td>
+<td>Integration and enterprise features; often expensive on-demand; capacity reservations</td>
+</tr>
+<tr>
+<td><strong>Neoclouds</strong></td>
+<td>CoreWeave, Nebius, Lambda, Crusoe, Together, Vultr, Fluidstack</td>
+<td>GPU-first, often cheaper, large clusters; less breadth</td>
+</tr>
+<tr>
+<td>Serverless GPU</td>
+<td>Modal, Baseten, Replicate, RunPod serverless, Fireworks, Together</td>
+<td>Pay per second; fastest to ship; less control</td>
+</tr>
+<tr>
+<td>Marketplaces</td>
+<td>Vast.ai, RunPod community, SF Compute</td>
+<td>Cheapest; variable reliability; good for learning</td>
+</tr>
+<tr>
+<td>On-prem</td>
+<td>DGX / HGX servers, SuperPODs</td>
+<td>Lowest cost at high, steady utilisation; power, cooling and staff needed</td>
+</tr>
+</tbody>
+</table>
+<p>H100 on-demand rental prices fell from roughly $8/hour in 2023 to around $2–3/hour at many providers by 2025, while Blackwell capacity commanded premiums. Check current prices; they move quickly.</p>
+<h2>FinOps for GPUs</h2>
+<ul>
+<li>Tag every job and deployment with team and project; report GPU-hours and dollars weekly.</li>
+<li>Track <strong>utilisation</strong>, not just allocation. Idle reserved GPUs are the most common waste.</li>
+<li>Use spot/preemptible instances for fault-tolerant jobs (evals, batch inference, checkpointed training).</li>
+<li>Right-size: a 7B model on an 80 GB GPU may be better as two replicas on MIG slices or a cheaper L40S / RTX PRO 6000.</li>
+<li>Schedule batch inference and evals into off-peak idle capacity.</li>
+</ul>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project 5: "We pay for idle GPUs overnight"</h3>
+<p><strong>Business problem:</strong> a company runs 12 always-on GPU replicas for internal models whose traffic drops 90% at night and on weekends.</p>
+<ol>
+<li>Create a Kubernetes cluster with GPU nodes (a managed cloud cluster or a single-node k3s with one GPU is enough to learn).</li>
+<li>Install the NVIDIA GPU Operator, Prometheus and KEDA. Deploy vLLM as above.</li>
+<li>Autoscale on waiting requests with scale-to-zero. Measure cold-start time, then cut it using a node-local weight cache and pre-pulled images.</li>
+<li>Replay a 24-hour traffic pattern (compressed in time). Report GPU-hours and cost vs. always-on, plus p95 latency including cold starts.</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>NVIDIA GPU Operator and DCGM documentation.</li>
+<li>Kubernetes Kueue, JobSet and LeaderWorkerSet documentation; llm-d project docs.</li>
+<li>KServe and Ray Serve documentation.</li>
+<li>Chip Huyen, <em>Designing Machine Learning Systems</em> (2022) and <em>AI Engineering</em> (2025).</li>
+<li>Stas Bekman, <em>Machine Learning Engineering Open Book</em>.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Gateways, Routing and Cost Engineering · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="20">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>LLM Gateways, Routing and Cost Engineering</h1>
+<p class="lede">Most companies don't run one model; they call several providers and a few self-hosted models from dozens of internal teams. The LLM gateway is the control point that makes this reliable, observable and affordable. It is one of the most practical systems you can build.</p>
+</header>
+
+<h2>The problems a gateway solves</h2>
+<ul>
+<li><strong>Runaway cost:</strong> nobody knows which team or feature spends what.</li>
+<li><strong>Outages and rate limits:</strong> a provider has an incident; your product goes down with it.</li>
+<li><strong>Latency spikes:</strong> p99 latency from APIs can be 10× the median.</li>
+<li><strong>Vendor lock-in:</strong> every team hard-codes a different SDK.</li>
+<li><strong>Compliance:</strong> PII leaving the company, missing audit logs.</li>
+<li><strong>Wasted spend:</strong> the same questions answered repeatedly; frontier models used for trivial tasks.</li>
+</ul>
+<h2>Architecture</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Apps and agents&quot;] --&gt; G
+    subgraph G[&quot;LLM Gateway&quot;]
+      direction TB
+      AU[&quot;Auth, API keys, per-team budgets&quot;] --&gt; RL[&quot;Rate limiting / quotas&quot;]
+      RL --&gt; GR[&quot;Guardrails: PII redaction, prompt-injection checks&quot;]
+      GR --&gt; CA{&quot;Cache hit? (exact or semantic)&quot;}
+      CA --&gt;|&quot;hit&quot;| RET[&quot;Return cached response&quot;]
+      CA --&gt;|&quot;miss&quot;| RO[&quot;Router: pick model by task, cost, latency&quot;]
+      RO --&gt; FB[&quot;Retries, timeouts, fallback chain, circuit breakers&quot;]
+      FB --&gt; LOG[&quot;Logging, tracing, token and cost accounting&quot;]
+    end
+    FB --&gt; P1[&quot;Provider A (Anthropic)&quot;]
+    FB --&gt; P2[&quot;Provider B (OpenAI / Google)&quot;]
+    FB --&gt; P3[&quot;Self-hosted vLLM cluster&quot;]
+    FB --&gt; P4[&quot;Cloud-hosted (Bedrock / Vertex / Azure)&quot;]
+</pre>
+</figure>
+<h2>Routing strategies</h2>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>How</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Static by feature</strong></td>
+<td>Config maps feature → model</td>
+<td>Autocomplete uses a small model; legal review uses frontier</td>
+</tr>
+<tr>
+<td><strong>Cascade</strong></td>
+<td>Try cheap model; escalate if confidence is low or a check fails</td>
+<td>Small model answers, validator checks JSON, escalate on failure</td>
+</tr>
+<tr>
+<td><strong>Learned router</strong></td>
+<td>Classifier predicts which model will succeed</td>
+<td>RouteLLM-style routers trained on preference data</td>
+</tr>
+<tr>
+<td><strong>Latency/cost-aware</strong></td>
+<td>Pick the provider with the best current p95 or price</td>
+<td>Live health scores per endpoint</td>
+</tr>
+<tr>
+<td><strong>Effort routing</strong></td>
+<td>Choose reasoning effort / thinking budget per query</td>
+<td>Chapter 13 project</td>
+</tr>
+</tbody>
+</table>
+<h2>Caching</h2>
+<ul>
+<li><strong>Exact cache:</strong> hash of (model, messages, parameters) → response. Safe, simple, good for repeated system tasks.</li>
+<li><strong>Semantic cache:</strong> embed the query; if a previous query is within a similarity threshold, reuse its answer. Big savings for FAQ-style traffic, but risky: "cancel my order" and "don't cancel my order" can be close in embedding space. Use high thresholds, scope by user/tenant, and never semantic-cache personalised or action-taking requests.</li>
+<li><strong>Provider prompt caching:</strong> structure prompts so the long stable prefix is identical across calls, and the provider discounts it (Chapter 19).</li>
+</ul>
+<h2>A working gateway in about 150 lines</h2>
+<pre><code class="language-python"># gateway.py  -- pip install fastapi uvicorn httpx redis numpy sentence-transformers
+import hashlib, json, time, asyncio, os
+import httpx, numpy as np, redis
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+
+app = FastAPI()
+r = redis.Redis(decode_responses=True)
+embedder = SentenceTransformer(&quot;BAAI/bge-small-en-v1.5&quot;)
+
+# price per 1M tokens (input, output) -- fill in current prices
+PROVIDERS = {
+    &quot;small&quot;: {&quot;url&quot;: &quot;http://vllm-small:8000/v1/chat/completions&quot;, &quot;model&quot;: &quot;Qwen/Qwen2.5-7B-Instruct&quot;,
+              &quot;key&quot;: None, &quot;price&quot;: (0.05, 0.10)},
+    &quot;frontier&quot;: {&quot;url&quot;: &quot;https://api.openai.com/v1/chat/completions&quot;, &quot;model&quot;: &quot;gpt-5.5&quot;,
+                 &quot;key&quot;: os.getenv(&quot;OPENAI_API_KEY&quot;), &quot;price&quot;: (1.25, 10.0)},
+}
+FALLBACKS = {&quot;small&quot;: [&quot;small&quot;, &quot;frontier&quot;], &quot;frontier&quot;: [&quot;frontier&quot;, &quot;small&quot;]}
+TEAM_BUDGET_USD = {&quot;support&quot;: 500.0, &quot;search&quot;: 2000.0}
+
+class ChatReq(BaseModel):
+    messages: list[dict]
+    tier: str | None = None          # caller may force a tier
+    max_tokens: int = 512
+    temperature: float = 0.0
+
+def route(req: ChatReq) -&gt; str:
+    if req.tier:
+        return req.tier
+    text = req.messages[-1][&quot;content&quot;]
+    hard = len(text) &gt; 2000 or any(w in text.lower() for w in [&quot;prove&quot;, &quot;analyze&quot;, &quot;step by step&quot;, &quot;code&quot;])
+    return &quot;frontier&quot; if hard else &quot;small&quot;
+
+def exact_key(req, tier):
+    blob = json.dumps({&quot;m&quot;: req.messages, &quot;t&quot;: tier, &quot;temp&quot;: req.temperature}, sort_keys=True)
+    return &quot;exact:&quot; + hashlib.sha256(blob.encode()).hexdigest()
+
+def semantic_lookup(text, threshold=0.95):
+    q = embedder.encode(text, normalize_embeddings=True)
+    for key in r.scan_iter(&quot;sem:*&quot;):                     # demo only: use a vector index in production
+        item = json.loads(r.get(key))
+        if float(np.dot(q, np.array(item[&quot;emb&quot;]))) &gt;= threshold:
+            return item[&quot;resp&quot;]
+    return None
+
+def semantic_store(text, resp):
+    emb = embedder.encode(text, normalize_embeddings=True).tolist()
+    key = &quot;sem:&quot; + hashlib.sha1(text.encode()).hexdigest()
+    r.set(key, json.dumps({&quot;emb&quot;: emb, &quot;resp&quot;: resp}), ex=86400)
+
+class Breaker:                                            # simple circuit breaker per provider
+    def __init__(self): self.fail, self.open_until = {}, {}
+    def ok(self, p): return time.time() &gt; self.open_until.get(p, 0)
+    def record(self, p, success):
+        if success: self.fail[p] = 0; return
+        self.fail[p] = self.fail.get(p, 0) + 1
+        if self.fail[p] &gt;= 3: self.open_until[p] = time.time() + 30
+breaker = Breaker()
+
+async def call(p, req):
+    cfg = PROVIDERS[p]
+    headers = {&quot;Authorization&quot;: f&quot;Bearer {cfg['key']}&quot;} if cfg[&quot;key&quot;] else {}
+    body = {&quot;model&quot;: cfg[&quot;model&quot;], &quot;messages&quot;: req.messages,
+            &quot;max_tokens&quot;: req.max_tokens, &quot;temperature&quot;: req.temperature}
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.post(cfg[&quot;url&quot;], json=body, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+def cost(p, usage):
+    pin, pout = PROVIDERS[p][&quot;price&quot;]
+    return usage.get(&quot;prompt_tokens&quot;, 0) / 1e6 * pin + usage.get(&quot;completion_tokens&quot;, 0) / 1e6 * pout
+
+@app.post(&quot;/v1/chat&quot;)
+async def chat(req: ChatReq, x_team: str = Header(...)):
+    spent = float(r.get(f&quot;spend:{x_team}&quot;) or 0)
+    if spent &gt;= TEAM_BUDGET_USD.get(x_team, 100):
+        raise HTTPException(429, f&quot;Monthly budget reached for team '{x_team}'&quot;)
+
+    tier = route(req)
+    ek = exact_key(req, tier)
+    if (hit := r.get(ek)):
+        return {&quot;cached&quot;: &quot;exact&quot;, **json.loads(hit)}
+    last = req.messages[-1][&quot;content&quot;]
+    if req.temperature == 0 and len(req.messages) == 1 and (hit := semantic_lookup(last)):
+        return {&quot;cached&quot;: &quot;semantic&quot;, **hit}
+
+    errors = []
+    for p in FALLBACKS[tier]:
+        if not breaker.ok(p):
+            errors.append(f&quot;{p}: circuit open&quot;); continue
+        for attempt in range(2):                          # retry with backoff
+            t0 = time.perf_counter()
+            try:
+                out = await call(p, req)
+                breaker.record(p, True)
+                usd = cost(p, out.get(&quot;usage&quot;, {}))
+                r.incrbyfloat(f&quot;spend:{x_team}&quot;, usd)
+                result = {&quot;provider&quot;: p, &quot;latency_ms&quot;: int((time.perf_counter() - t0) * 1000),
+                          &quot;cost_usd&quot;: round(usd, 6), &quot;response&quot;: out[&quot;choices&quot;][0][&quot;message&quot;][&quot;content&quot;]}
+                r.set(ek, json.dumps(result), ex=3600)
+                if req.temperature == 0 and len(req.messages) == 1:
+                    semantic_store(last, result)
+                return {&quot;cached&quot;: None, **result}
+            except Exception as e:
+                breaker.record(p, False)
+                errors.append(f&quot;{p}#{attempt}: {e}&quot;)
+                await asyncio.sleep(0.5 * 2 ** attempt)
+    raise HTTPException(503, {&quot;error&quot;: &quot;all providers failed&quot;, &quot;details&quot;: errors})
+</code></pre>
+<p>Production gateways add streaming passthrough, a proper vector index for the semantic cache, OpenTelemetry tracing, async logging to a warehouse, per-key rate limits (token bucket in Redis), and admin dashboards. Open-source and commercial options include <strong>LiteLLM</strong>, <strong>Portkey</strong>, <strong>Kong AI Gateway</strong>, <strong>Cloudflare AI Gateway</strong>, <strong>OpenRouter</strong> (a hosted multi-provider router), <strong>Envoy AI Gateway</strong>, and cloud-native offerings.</p>
+<h2>Cost engineering checklist</h2>
+<ol>
+<li><strong>Measure first:</strong> tokens in/out, cost and latency per feature, per team, per customer.</li>
+<li><strong>Right-size models:</strong> most traffic doesn't need the frontier model.</li>
+<li><strong>Trim prompts:</strong> remove redundant instructions and oversized RAG context; long system prompts are paid on every call (unless cached).</li>
+<li><strong>Cap output:</strong> <code>max_tokens</code>, concise-style instructions, structured output instead of prose.</li>
+<li><strong>Cache:</strong> exact, semantic (carefully), and provider prompt caching.</li>
+<li><strong>Batch APIs:</strong> offline jobs via providers' batch endpoints at roughly 50% discount.</li>
+<li><strong>Self-host the high-volume, narrow tasks</strong> (Chapter 18) once volume crosses break-even.</li>
+<li><strong>Set budgets and alerts</strong> per team; agents in loops can burn thousands of dollars overnight.</li>
+</ol>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project 2: "Latency spikes and runaway costs"</h3>
+<p><strong>Business problem:</strong> a SaaS company's AI features call one provider directly. Last month an outage took the product down for two hours, and the bill doubled without anyone knowing why.</p>
+<ol>
+<li>Build the gateway above; add streaming, Prometheus metrics (requests, tokens, cost, latency histograms per provider and team) and a Grafana dashboard.</li>
+<li>Replay a realistic traffic log (e.g., a public chat dataset such as LMSYS-Chat-1M or WildChat).</li>
+<li>Measure: cache hit rate, % routed to the small model, quality on a sample judged by a strong model, total cost vs. "everything to frontier."</li>
+<li>Chaos test: kill one provider mid-test and show zero failed user requests.</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Ong et al., <em>RouteLLM: Learning to Route LLMs with Preference Data</em> (2024).</li>
+<li>Chen et al., <em>FrugalGPT</em> (2023): cascades and cost reduction.</li>
+<li>LiteLLM and Portkey documentation (open-source gateways).</li>
+<li>Provider docs on prompt caching and batch APIs (Anthropic, OpenAI, Google).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

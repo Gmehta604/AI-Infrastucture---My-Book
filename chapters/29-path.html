@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Your Path: Projects, Plan and Reading List · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="29">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Your Path: Projects, Plan and Reading List</h1>
+<p class="lede">Knowledge becomes expertise through building. This chapter turns the book into a plan: a sequence of portfolio projects that each solve a real business bottleneck, a 12-month schedule, and a curated reading list in the order you should read it.</p>
+</header>
+
+<h2>The project ladder</h2>
+<p>Every project below appears in an earlier chapter's "Build it" box. Together they cover the skills companies hire AI infrastructure engineers for. Do them roughly in this order; each builds on the last.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Project</th>
+<th>Business bottleneck</th>
+<th>Chapter</th>
+<th>Rough GPU cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>Churn model with cost-aware threshold</td>
+<td>Metrics tied to money</td>
+<td>3</td>
+<td>None</td>
+</tr>
+<tr>
+<td>1</td>
+<td>Train a small GPT and measure MFU</td>
+<td>"Can we afford a custom model?"</td>
+<td>10</td>
+<td>$20–100</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Kernel optimisation report</td>
+<td>"Training is slow and GPUs are underused"</td>
+<td>16</td>
+<td>$10–30</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>LLM serving cost reduction</strong> (flagship)</td>
+<td>"Our LLM bill is too high"</td>
+<td>19</td>
+<td>$10–40</td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>LLM gateway</strong> with routing, caching, failover</td>
+<td>"Latency spikes and runaway costs"</td>
+<td>20</td>
+<td>API credits</td>
+</tr>
+<tr>
+<td>5</td>
+<td><strong>RAG with an eval harness</strong></td>
+<td>"The chatbot makes things up"</td>
+<td>21</td>
+<td>Small</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Fine-tune a small model to replace an API call</td>
+<td>"Frontier API costs too much at our volume"</td>
+<td>18</td>
+<td>$10–50</td>
+</tr>
+<tr>
+<td>7</td>
+<td>GRPO on a verifiable extraction task</td>
+<td>"We need a reliable, cheap specialist model"</td>
+<td>12</td>
+<td>$20–80</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Thinking-budget router</td>
+<td>"Reasoning models tripled our bill"</td>
+<td>13</td>
+<td>API credits</td>
+</tr>
+<tr>
+<td>9</td>
+<td>Scale training from 1 to 32 GPUs</td>
+<td>"Will more nodes actually help?"</td>
+<td>17</td>
+<td>$100–300</td>
+</tr>
+<tr>
+<td>10</td>
+<td>Autoscaling with scale-to-zero on Kubernetes</td>
+<td>"We pay for idle GPUs overnight"</td>
+<td>24</td>
+<td>$20–60</td>
+</tr>
+<tr>
+<td>11</td>
+<td>Evals in CI + tracing</td>
+<td>"A prompt change broke production"</td>
+<td>23</td>
+<td>Small</td>
+</tr>
+<tr>
+<td>12</td>
+<td>On-call agent for GPU cluster incidents</td>
+<td>"Engineers wait hours for platform help"</td>
+<td>22</td>
+<td>API credits</td>
+</tr>
+</tbody>
+</table>
+<h3>How to present each project</h3>
+<p>A hiring manager reads a README for two minutes. Structure each one as:</p>
+<ol>
+<li><strong>Problem:</strong> one paragraph in business terms ("A company serving 5M requests/day at $X...").</li>
+<li><strong>Baseline:</strong> what the naive solution costs or how slowly it runs, measured.</li>
+<li><strong>What you changed:</strong> each optimisation, with the measured effect of each.</li>
+<li><strong>Results:</strong> one chart (latency vs throughput, cost vs accuracy) and one table.</li>
+<li><strong>Trade-offs and what you'd do next:</strong> shows judgement.</li>
+<li><strong>Reproduce:</strong> exact commands, versions, hardware.</li>
+</ol>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Pick a real bottleneck&quot;] --&gt; B[&quot;Measure baseline honestly&quot;]
+    B --&gt; C[&quot;Change one thing&quot;]
+    C --&gt; D[&quot;Measure again&quot;]
+    D --&gt;|&quot;repeat&quot;| C
+    D --&gt; E[&quot;Write up: problem, numbers, trade-offs&quot;]
+    E --&gt; F[&quot;Publish: GitHub + short blog post&quot;]
+</pre>
+</figure>
+<h2>A 12-month plan (10–15 hours per week)</h2>
+<table>
+<thead>
+<tr>
+<th>Months</th>
+<th>Focus</th>
+<th>Chapters</th>
+<th>Milestones</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Python, NumPy, PyTorch basics; math refresh</td>
+<td>1–5</td>
+<td>micrograd from scratch; Project 0</td>
+</tr>
+<tr>
+<td>2</td>
+<td>CNNs, sequences, tokenization</td>
+<td>6–8</td>
+<td>Tokenizer from scratch</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Transformers</td>
+<td>9–10</td>
+<td>Your own GPT trained on real text; Project 1</td>
+</tr>
+<tr>
+<td>4</td>
+<td>MoE, post-training, reasoning</td>
+<td>11–13</td>
+<td>Project 7 on a small model</td>
+</tr>
+<tr>
+<td>5</td>
+<td>GPUs, kernels, profiling</td>
+<td>15–16</td>
+<td>Triton kernels; Project 2</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Inference and serving</td>
+<td>19</td>
+<td><strong>Project 3 (flagship)</strong></td>
+</tr>
+<tr>
+<td>7</td>
+<td>Gateways and cost</td>
+<td>20</td>
+<td>Project 4</td>
+</tr>
+<tr>
+<td>8</td>
+<td>RAG and evals</td>
+<td>21, 23</td>
+<td>Projects 5 and 11</td>
+</tr>
+<tr>
+<td>9</td>
+<td>Fine-tuning</td>
+<td>18</td>
+<td>Project 6</td>
+</tr>
+<tr>
+<td>10</td>
+<td>Distributed training</td>
+<td>17</td>
+<td>Project 9</td>
+</tr>
+<tr>
+<td>11</td>
+<td>Platform and Kubernetes</td>
+<td>24–25</td>
+<td>Project 10</td>
+</tr>
+<tr>
+<td>12</td>
+<td>Agents, safety, frontier; consolidate portfolio</td>
+<td>22, 26–28</td>
+<td>Project 12; polish write-ups; contribute a PR to vLLM, SGLang or TorchTitan</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Contributing to open source</strong> is the strongest signal you can send. Start with documentation fixes and small bugs in vLLM, SGLang, llama.cpp, TorchTitan, Hugging Face libraries or Triton, then move to performance work.</p>
+<h2>Reading list, in order</h2>
+<h3>Foundational papers</h3>
+<ol>
+<li>Rumelhart, Hinton, Williams, <em>Learning representations by back-propagating errors</em> (1986)</li>
+<li>Krizhevsky, Sutskever, Hinton, <em>ImageNet Classification with Deep CNNs</em> (AlexNet, 2012)</li>
+<li>Kingma and Ba, <em>Adam</em> (2014)</li>
+<li>He et al., <em>Deep Residual Learning</em> (ResNet, 2015)</li>
+<li>Bahdanau et al., <em>Neural Machine Translation by Jointly Learning to Align and Translate</em> (2014)</li>
+<li>Vaswani et al., <em>Attention Is All You Need</em> (2017)</li>
+<li>Radford et al., <em>Language Models are Unsupervised Multitask Learners</em> (GPT-2, 2019)</li>
+<li>Brown et al., <em>Language Models are Few-Shot Learners</em> (GPT-3, 2020)</li>
+<li>Kaplan et al., <em>Scaling Laws</em> (2020); Hoffmann et al., <em>Chinchilla</em> (2022)</li>
+<li>Ouyang et al., <em>InstructGPT</em> (2022); Bai et al., <em>Constitutional AI</em> (2022)</li>
+<li>Rafailov et al., <em>DPO</em> (2023)</li>
+<li>Touvron et al., <em>Llama</em> and <em>Llama 2</em> (2023); Meta, <em>The Llama 3 Herd of Models</em> (2024)</li>
+<li>DeepSeek-AI, <em>DeepSeek-V3 Technical Report</em> (2024) and <em>DeepSeek-R1</em> (2025)</li>
+</ol>
+<h3>Infrastructure papers</h3>
+<ol>
+<li>Micikevicius et al., <em>Mixed Precision Training</em> (2017)</li>
+<li>Shoeybi et al., <em>Megatron-LM</em> (2019); Rajbhandari et al., <em>ZeRO</em> (2019)</li>
+<li>Narayanan et al., <em>Efficient Large-Scale LM Training on GPU Clusters</em> (2021)</li>
+<li>Dao et al., <em>FlashAttention</em> (2022), FlashAttention-2 (2023), FlashAttention-3 (2024)</li>
+<li>Yu et al., <em>Orca: continuous batching</em> (2022)</li>
+<li>Kwon et al., <em>PagedAttention / vLLM</em> (2023)</li>
+<li>Zheng et al., <em>SGLang</em> (2023)</li>
+<li>Leviathan et al., <em>Speculative Decoding</em> (2023); Li et al., <em>EAGLE</em> series</li>
+<li>Frantar et al., <em>GPTQ</em> (2022); Lin et al., <em>AWQ</em> (2023); Dettmers et al., <em>QLoRA</em> (2023)</li>
+<li>Zhong et al., <em>DistServe</em> (2024); Qin et al., <em>Mooncake</em> (2024)</li>
+<li>Hu et al., <em>LoRA</em> (2021); Sheng et al., <em>S-LoRA</em> (2023)</li>
+<li>Fedus et al., <em>Switch Transformers</em> (2021); DeepSeek-AI, <em>DeepSeekMoE</em> (2024)</li>
+<li>Gu and Dao, <em>Mamba</em> (2023); Yang et al., <em>Gated DeltaNet</em> (2024)</li>
+</ol>
+<h3>Books and long-form guides</h3>
+<ul>
+<li>Hugging Face, <em>The Ultra-Scale Playbook</em> (distributed training)</li>
+<li>Google DeepMind, <em>How to Scale Your Model</em> (TPU/GPU scaling math)</li>
+<li>Chip Huyen, <em>AI Engineering</em> (2025) and <em>Designing Machine Learning Systems</em> (2022)</li>
+<li>Sebastian Raschka, <em>Build a Large Language Model (From Scratch)</em> (2024)</li>
+<li>Stas Bekman, <em>Machine Learning Engineering Open Book</em> (GitHub)</li>
+<li>Hwu, Kirk, El Hajj, <em>Programming Massively Parallel Processors</em></li>
+<li>Nathan Lambert, <em>RLHF Book</em> (rlhfbook.com)</li>
+<li>Goodfellow, Bengio, Courville, <em>Deep Learning</em></li>
+</ul>
+<h3>Video courses</h3>
+<ul>
+<li>Andrej Karpathy, <em>Neural Networks: Zero to Hero</em> (micrograd → GPT → tokenizer → reproducing GPT-2)</li>
+<li>Stanford <strong>CS336: Language Modeling from Scratch</strong></li>
+<li>Stanford <strong>CS231n</strong> (vision) and <strong>CS224n</strong> (NLP)</li>
+<li><strong>GPU MODE</strong> lecture series</li>
+<li>MIT <strong>6.5940 TinyML and Efficient Deep Learning</strong> (Song Han): quantization, pruning, efficient inference</li>
+<li>3Blue1Brown, <em>Neural Networks</em> and <em>Linear Algebra</em> series</li>
+</ul>
+<h2>Where to get compute cheaply</h2>
+<ul>
+<li><strong>Free:</strong> Google Colab, Kaggle notebooks (GPU hours per week), Lightning AI free tier.</li>
+<li><strong>Cheap hourly:</strong> RunPod, Vast.ai, Lambda, TensorDock for single GPUs; spot instances on major clouds.</li>
+<li><strong>Serverless:</strong> Modal and similar platforms often include monthly free credits.</li>
+<li><strong>Startup and research credits</strong> from cloud providers, and NVIDIA's developer programmes.</li>
+<li>Always <strong>shut down instances</strong> when finished; set budget alerts.</li>
+</ul>
+<div class="callout"><p><strong>Final key idea.</strong> The people who stand out in AI infrastructure are not the ones who have read the most, but the ones who can say: "I measured it, here is where the time and money went, here is what I changed, and here is the number that moved." Every chapter of this book gives you something to measure. Go measure it.</p></div>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

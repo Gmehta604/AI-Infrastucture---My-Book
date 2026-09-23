@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Math You Actually Need · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="2">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>The Math You Actually Need</h1>
+<p class="lede">You do not need a math degree to work in AI infrastructure, but you need four tools fluently: vectors and matrices, derivatives, probability, and a little information theory. This chapter teaches each one with code, because code is how you will use them.</p>
+</header>
+
+<h2>Vectors, matrices and tensors</h2>
+<p>A <strong>vector</strong> is a list of numbers. In AI it almost always represents <em>something</em>: a word, an image patch, a user. A <strong>matrix</strong> is a grid of numbers, and it almost always represents a <em>transformation</em> that turns one vector into another. A <strong>tensor</strong> is the general name for an n-dimensional array. A batch of 32 sentences, each 512 tokens long, each token a 4096-number vector, is a tensor of shape <code>(32, 512, 4096)</code>.</p>
+<pre><code class="language-python">import numpy as np
+
+x = np.array([1.0, 2.0, 3.0])          # vector, shape (3,)
+W = np.array([[0.1, 0.2, 0.3],
+              [0.4, 0.5, 0.6]])        # matrix, shape (2, 3)
+y = W @ x                              # matrix-vector product, shape (2,)
+print(y)                               # [1.4 3.2]
+
+batch = np.random.randn(32, 512, 4096) # a 3-D tensor
+print(batch.shape, batch.nbytes / 1e6, &quot;MB in float64&quot;)
+</code></pre>
+<h3>The dot product: the most important operation in AI</h3>
+<p>The dot product of two vectors multiplies them element by element and sums the result. It measures how <strong>aligned</strong> two vectors are.</p>
+<div class="math">a · b = a₁b₁ + a₂b₂ + … + aₙbₙ = |a| |b| cos θ</div>
+
+<ul>
+<li>Large positive: vectors point the same way (similar meaning).</li>
+<li>Near zero: unrelated (orthogonal).</li>
+<li>Negative: opposite.</li>
+</ul>
+<p>Attention (Chapter 9) is dot products between "queries" and "keys". Vector search (Chapter 21) is dot products between a question and documents. <strong>Cosine similarity</strong> is the dot product of normalised vectors.</p>
+<pre><code class="language-python">def cosine(a, b):
+    return a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+
+king  = np.array([0.9, 0.8, 0.1])
+queen = np.array([0.88, 0.82, 0.9])
+apple = np.array([-0.2, 0.1, 0.05])
+print(cosine(king, queen), cosine(king, apple))
+</code></pre>
+<h3>Matrix multiplication and why it dominates compute</h3>
+<p>Multiplying an <code>(M×K)</code> matrix by a <code>(K×N)</code> matrix produces <code>(M×N)</code> and costs <strong>2·M·N·K floating-point operations</strong> (one multiply and one add per term). Nearly all the compute in a neural network is matrix multiplication ("matmul" or "GEMM", general matrix multiply). GPUs exist to do this fast.</p>
+<div class="math">FLOPs(matmul) = 2 · M · N · K</div>
+
+<p>This formula is the root of the most useful rule of thumb in the field: a Transformer with <strong>N parameters</strong> costs about <strong>2N FLOPs per token</strong> to run forward, and about <strong>6N FLOPs per token</strong> to train (forward + backward, where backward costs about twice the forward). You will use this constantly in Chapters 10, 15 and 19.</p>
+<pre><code class="language-python"># Worked example: how long to train a 7B model on 2T tokens on 64 H100s?
+N, D = 7e9, 2e12
+train_flops = 6 * N * D                 # 8.4e22 FLOPs
+h100_bf16 = 989e12                      # dense BF16 peak FLOP/s
+mfu = 0.40                              # realistic model FLOPs utilisation
+seconds = train_flops / (64 * h100_bf16 * mfu)
+print(f&quot;{seconds/86400:.1f} days&quot;)      # ≈ 38 days
+</code></pre>
+<h3>Shapes and broadcasting</h3>
+<p>Most bugs in AI code are shape bugs. Get into the habit of writing shapes as comments. <strong>Broadcasting</strong> lets NumPy and PyTorch combine arrays of different shapes by virtually stretching size-1 dimensions:</p>
+<pre><code class="language-python">X = np.random.randn(64, 10)   # 64 examples, 10 features
+mu = X.mean(axis=0)            # (10,)
+Xc = X - mu                    # (64,10) - (10,) broadcasts to (64,10)
+</code></pre>
+<h2>Derivatives and gradients</h2>
+<p>Training means adjusting numbers (weights) to make an error (loss) smaller. The <strong>derivative</strong> tells you how much the output changes when you nudge an input.</p>
+<div class="math">f(x) = x²      f'(x) = 2x      at x = 3, nudging x up by 0.001 raises f by about 0.006</div>
+
+<p>With many inputs, the vector of all partial derivatives is the <strong>gradient</strong>, written ∇f. It points in the direction of steepest increase, so to <em>decrease</em> the loss you step the opposite way. That is <strong>gradient descent</strong>:</p>
+<div class="math">w ← w − η · ∇L(w)          (η is the learning rate)</div>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Weights w&quot;] --&gt; B[&quot;Forward pass: compute predictions&quot;]
+    B --&gt; C[&quot;Loss L: how wrong are we?&quot;]
+    C --&gt; D[&quot;Backward pass: gradient ∇L&quot;]
+    D --&gt; E[&quot;Update: w = w - lr x grad&quot;]
+    E --&gt; A
+</pre>
+</figure>
+<h3>The chain rule: the engine of backpropagation</h3>
+<p>If <code>y = f(g(x))</code>, then <code>dy/dx = f'(g(x)) · g'(x)</code>. A neural network is a long chain of functions, so the gradient of the loss with respect to any weight is a product of local derivatives along the path. Backpropagation (Chapter 4) is just the chain rule applied efficiently from the output backwards.</p>
+<pre><code class="language-python"># gradient descent on f(w) = (w - 3)^2, minimum at w = 3
+w, lr = 0.0, 0.1
+for step in range(50):
+    grad = 2 * (w - 3)
+    w -= lr * grad
+print(round(w, 4))   # 3.0
+</code></pre>
+<h2>Probability</h2>
+<p>Language models are probability machines: given text so far, they output a <strong>probability distribution</strong> over the next token.</p>
+<ul>
+<li>A <strong>distribution</strong> assigns probabilities that sum to 1.</li>
+<li><strong>Softmax</strong> turns any list of scores ("logits") into a distribution:</li>
+</ul>
+<div class="math">softmax(zᵢ) = exp(zᵢ) / Σⱼ exp(zⱼ)</div>
+
+<pre><code class="language-python">def softmax(z):
+    z = z - z.max()            # subtract max for numerical stability
+    e = np.exp(z)
+    return e / e.sum()
+
+logits = np.array([2.0, 1.0, 0.1])
+print(softmax(logits))          # [0.659 0.242 0.099]
+print(softmax(logits / 0.5))    # temperature 0.5: sharper
+print(softmax(logits / 2.0))    # temperature 2.0: flatter
+</code></pre>
+<p><strong>Temperature</strong> divides the logits before softmax. Low temperature makes the model nearly deterministic; high temperature makes it more random. That is the knob you see in every LLM API.</p>
+<p>Other ideas you will meet: <strong>expectation</strong> (the average outcome), <strong>variance</strong> (spread), the <strong>normal distribution</strong> (used for weight initialisation), <strong>conditional probability</strong> P(A|B), and <strong>Bayes' rule</strong>. An autoregressive language model factorises the probability of a text with the chain rule of probability:</p>
+<div class="math">P(w₁, w₂, …, wₙ) = P(w₁) · P(w₂|w₁) · P(w₃|w₁,w₂) · … · P(wₙ|w₁…wₙ₋₁)</div>
+
+<p>That one equation is the whole idea of GPT: learn each conditional factor with a neural network.</p>
+<h2>Information theory: entropy and cross-entropy</h2>
+<p><strong>Entropy</strong> measures uncertainty in bits (log base 2) or nats (natural log). A fair coin has 1 bit of entropy; a coin that always lands heads has 0.</p>
+<p><strong>Cross-entropy</strong> measures how well a predicted distribution q matches the true distribution p. For classification and language modelling, the true answer is one specific token, so cross-entropy reduces to <strong>the negative log of the probability you assigned to the right answer</strong>:</p>
+<div class="math">loss = −log q(correct token)</div>
+
+<p>If the model gives the right token probability 0.9, loss is 0.105. If it gives 0.01, loss is 4.6. This is <em>the</em> loss function of LLM pretraining.</p>
+<p><strong>Perplexity</strong> = exp(average cross-entropy). Intuitively, it is the number of tokens the model is "choosing between" on average. A perplexity of 10 means the model is as uncertain as if picking uniformly among 10 options.</p>
+<p><strong>KL divergence</strong> measures how different two distributions are. It appears in RLHF (Chapter 12) as a penalty that stops the fine-tuned model drifting too far from the original, and in distillation.</p>
+<pre><code class="language-python">def cross_entropy(probs, target_idx):
+    return -np.log(probs[target_idx])
+
+p = softmax(np.array([3.0, 0.5, 0.2]))
+print(cross_entropy(p, 0), cross_entropy(p, 2))
+print(&quot;perplexity:&quot;, np.exp(cross_entropy(p, 0)))
+</code></pre>
+<h2>Numbers in computers: precision formats</h2>
+<p>This topic is where math meets infrastructure. Neural networks tolerate imprecision, so the industry keeps shrinking the number of bits per number, which saves memory, bandwidth and energy.</p>
+<table>
+<thead>
+<tr>
+<th>Format</th>
+<th>Bits</th>
+<th>Exponent / mantissa</th>
+<th>Typical use in 2026</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32</td>
+<td>32</td>
+<td>8 / 23</td>
+<td>Master weights, optimizer state, reductions</td>
+</tr>
+<tr>
+<td>TF32</td>
+<td>19 (stored as 32)</td>
+<td>8 / 10</td>
+<td>Matmuls on NVIDIA Ampere+ by default</td>
+</tr>
+<tr>
+<td>FP16</td>
+<td>16</td>
+<td>5 / 10</td>
+<td>Older mixed precision (needs loss scaling)</td>
+</tr>
+<tr>
+<td>BF16</td>
+<td>16</td>
+<td>8 / 7</td>
+<td>Standard training and serving format</td>
+</tr>
+<tr>
+<td>FP8 (E4M3 / E5M2)</td>
+<td>8</td>
+<td>4/3 or 5/2</td>
+<td>Training (DeepSeek-V3 onwards) and serving on Hopper/Blackwell</td>
+</tr>
+<tr>
+<td>INT8</td>
+<td>8</td>
+<td>integer</td>
+<td>Weight / activation quantization</td>
+</tr>
+<tr>
+<td>FP4 / NVFP4 / MXFP4</td>
+<td>4</td>
+<td>2 / 1 + shared scale</td>
+<td>Blackwell/Rubin inference; some training</td>
+</tr>
+<tr>
+<td>INT4</td>
+<td>4</td>
+<td>integer</td>
+<td>Weight-only quantization (GPTQ, AWQ)</td>
+</tr>
+</tbody>
+</table>
+<p>The <strong>exponent bits</strong> set the <em>range</em> (how big or small a number can be); the <strong>mantissa bits</strong> set the <em>precision</em>. BF16 keeps FP32's 8 exponent bits, so it rarely overflows. That is why it replaced FP16 for training.</p>
+<pre><code class="language-python">import torch
+x = torch.tensor(1/3, dtype=torch.float32)
+for dt in [torch.float32, torch.bfloat16, torch.float16]:
+    print(dt, x.to(dt).item())
+# float32  0.3333333432674408
+# bfloat16 0.333984375
+# float16  0.333251953125
+</code></pre>
+<div class="callout"><p><strong>Key idea.</strong> Memory for a model = parameters × bytes per parameter. A 70B model is 140 GB in BF16, 70 GB in FP8, 35 GB in 4-bit. Much of inference engineering (Chapter 19) is about this one multiplication.</p></div>
+<h2>Practice</h2>
+<ol>
+<li>Compute by hand the FLOPs to multiply a (4096×4096) matrix by a (4096×8192) matrix. (Answer: about 275 GFLOPs.)</li>
+<li>Implement softmax without the <code>z - z.max()</code> line and feed it <code>[1000, 1001]</code>. What happens and why?</li>
+<li>A model assigns the correct next token probability 0.25 on average. What is its loss in nats and its perplexity?</li>
+</ol>
+<h2>Resources</h2>
+<ul>
+<li>3Blue1Brown, <em>Essence of Linear Algebra</em> and <em>Neural Networks</em> series (YouTube).</li>
+<li><em>Mathematics for Machine Learning</em>, Deisenroth, Faisal and Ong (free PDF).</li>
+<li>Karpathy's <em>Neural Networks: Zero to Hero</em> playlist, the first video on micrograd.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

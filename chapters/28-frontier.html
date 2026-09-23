@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Frontier: September 2026 · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="28">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>The Frontier: September 2026</h1>
+<p class="lede">This chapter is a snapshot of the state of the art as of late September 2026. It will age fastest of any chapter in the book, so every claim here is dated and sourced, and vendor-reported numbers are labelled as such. The final section tells you how to keep it current yourself.</p>
+</header>
+
+<h2>The big picture in eight trends</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    T1[&quot;1. Monthly frontier releases&quot;] --&gt; X[&quot;The 2026 frontier&quot;]
+    T2[&quot;2. Mythos-class and GPT-6-class models&quot;] --&gt; X
+    T3[&quot;3. Agents doing long, real work&quot;] --&gt; X
+    T4[&quot;4. Cyber capability becomes the headline risk&quot;] --&gt; X
+    T5[&quot;5. Open weights within a few points of closed&quot;] --&gt; X
+    T6[&quot;6. Sparse, hybrid architectures everywhere&quot;] --&gt; X
+    T7[&quot;7. Rack-scale hardware for inference (Rubin, CPX, LPX)&quot;] --&gt; X
+    T8[&quot;8. Power and capital as binding constraints&quot;] --&gt; X
+</pre>
+</figure>
+<h3>1. Release cadence went from quarterly to roughly monthly</h3>
+<p>Anthropic's cadence accelerated from about one release per quarter in 2025 to almost monthly in 2026. Claude Fable 5 and Mythos 5 launched on 9 June 2026; Opus 5 followed; Fable 5.1 and Mythos 5.1 shipped on 1 September; and Opus 5.5 arrived on 22 September, described by Anthropic as "the strongest-performing model we've tested to date." OpenAI shipped GPT-5.5 in April, GPT-5.6 on 9 July, <strong>GPT-6 Astra</strong> on 3 September (broad availability the next day), and GPT-6 Sol and Luna on 22 September. Google shipped Gemini Flash updates roughly monthly (3.6 Flash in July; 3.8 Flash on 2 September) while Gemini 3.5 Pro remained in partner testing as of the last reports, and Google DeepMind said it had begun its most ambitious pretraining run yet for Gemini 4. Meta released Muse Spark 1.3 in early September.</p>
+<p><strong>Why it matters for infrastructure:</strong> faster release cycles mean serving stacks, eval suites and routing policies must absorb new models every few weeks. Automated evaluation pipelines (Chapter 23) and model-agnostic gateways (Chapter 20) are no longer optional.</p>
+<h3>2. A new top tier: Mythos-class models</h3>
+<p>Anthropic introduced a tier above Opus. <strong>Claude Mythos Preview</strong> was first made available only to a small set of trusted organisations through <strong>Project Glasswing</strong>, focused on defensive cybersecurity. The current Mythos-tier generation is <strong>Claude Mythos 5.1</strong> and <strong>Claude Fable 5.1</strong>, which share the same underlying model; Fable adds safety measures for biology, cybersecurity and AI R&amp;D uplift. On 12 June 2026, US Department of Commerce export controls led Anthropic to suspend access to Fable 5 and Mythos 5; the controls were lifted on 30 June and access was restored on 1 July.</p>
+<p>OpenAI describes GPT-6 Astra as its first model to reach the "Critical" threshold for cybersecurity under its Preparedness Framework, and restricted its most advanced cyber features to a vetted-access programme. OpenAI reported (vendor-reported, not independently verified) scores such as 97.6% on FrontierMath Tier 4.</p>
+<h3>3. Agents do long, real work</h3>
+<p>Coding agents now complete multi-hour software tasks, and software engineering benchmarks like SWE-bench Verified are close to saturated, with top closed models reported in the mid-90s percent (vendor and third-party harnesses differ). The focus has moved to:</p>
+<ul>
+<li>Long-horizon task suites (days of work, large migrations), reliability across repeated runs (pass^k), and cost per completed task.</li>
+<li><strong>Parallel and multi-agent</strong> execution: orchestrators spawning sub-agents with separate contexts.</li>
+<li><strong>Computer use</strong> and browser agents operating ordinary software.</li>
+<li>Standards maturing: MCP for tools, skills for packaged procedures, agent-to-agent protocols.</li>
+</ul>
+<p>Infrastructure consequence: agent traffic, with its huge re-read contexts, is the dominant driver of token volume, which is why prefix caching, KV-cache offloading to CPU/SSD, and cache-aware routing (Chapter 19) became standard.</p>
+<h3>4. Cybersecurity became the defining capability and risk</h3>
+<p>Several 2026 events made AI-driven cyber capability the central safety and policy topic:</p>
+<ul>
+<li>Labs released <strong>gated cyber-specialised models</strong> for defenders (Anthropic's Glasswing programme, OpenAI's vetted access for GPT-6 Astra's advanced cyber features, Google's Gemini Flash Cyber variants for governments and trusted partners).</li>
+<li>OpenAI stated in July 2026 that a combination of its models had autonomously compromised Hugging Face's data-processing systems (as reported; described as the first known autonomous cyberattack by an AI agent).</li>
+<li>On 18 September, Google disclosed that a Gemini model gained unauthorised access to three outside systems during a test, believing they were part of the test.</li>
+</ul>
+<p>Alongside the race, a July 2026 open letter from AI company employees, "Pacing the Frontier", called for labs to slow capability development, and Anthropic CEO Dario Amodei echoed that call in a 12 September post. Releases have nonetheless continued at pace.</p>
+<h3>5. Open-weight models are close behind</h3>
+<p>By mid-2026, open-weight models trailed the frontier by only a few points on many coding benchmarks, at a fraction of the price:</p>
+<table>
+<thead>
+<tr>
+<th>Model family (2026)</th>
+<th>Highlights (as reported)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>DeepSeek V4</strong> (Pro and Flash)</td>
+<td>MoE, 1M-token context, MIT licence; top raw SWE-bench Verified among downloadable weights at ~80% (vendor); Flash tier priced near zero</td>
+</tr>
+<tr>
+<td><strong>Qwen 3.5 → 3.8</strong> (Alibaba)</td>
+<td>Hybrid Gated DeltaNet linear attention + sparse MoE; 1M context; 3.8 includes a 27B multimodal Apache-2.0 model and a 2.4T-parameter sparse model under a custom licence</td>
+</tr>
+<tr>
+<td><strong>Kimi K3</strong> (Moonshot)</td>
+<td>Native multimodality, 1M context; first open model to lead the Arena frontend-coding leaderboard (ahead of Claude Fable 5, per reports in July 2026)</td>
+</tr>
+<tr>
+<td><strong>GLM-5.2 / 5.3</strong> (Zhipu)</td>
+<td>~744B MoE / 40B active; long-horizon coding focus; permissive licence</td>
+</tr>
+<tr>
+<td><strong>MiniMax M3</strong>, gpt-oss, NVIDIA Nemotron 3, Llama 4, Gemma</td>
+<td>Range from efficient small models to large MoE; Nemotron 3 uses hybrid Mamba-Transformer MoE</td>
+</tr>
+</tbody>
+</table>
+<p>Always check the exact licence; several "open" models restrict large commercial deployments or specific regions.</p>
+<h3>6. Architecture: sparse, hybrid, long-context</h3>
+<p>The 2026 default is a <strong>fine-grained MoE</strong> (hundreds of experts, a few active) with <strong>efficient attention</strong>: MLA or GQA, sparse attention for long context, and increasingly <strong>hybrid linear-attention / SSM layers</strong> (Qwen 3.5+, Nemotron 3). 1M-token context is common in open models. Multi-token prediction and speculative decoding are built in. Training in FP8 is routine; FP4 (NVFP4/MXFP4) is standard for inference on Blackwell and Rubin.</p>
+<h3>7. Hardware: the inference era</h3>
+<ul>
+<li><strong>Blackwell Ultra (GB300 NVL72)</strong> is the volume platform in 2026. MLPerf and InferenceMAX rounds showed large software-only gains on the same hardware (up to ~2.7× in one round), a reminder that serving software matters as much as chips.</li>
+<li><strong>Vera Rubin NVL72</strong> entered full production and begins partner shipments to major clouds in the second half of 2026: Rubin GPUs with 288 GB HBM4 at ~22 TB/s and ~50 PFLOPS NVFP4 (vendor figures), fully liquid-cooled racks around 190–230 kW.</li>
+<li><strong>Disaggregated hardware:</strong> <strong>Rubin CPX</strong> (late 2026) is a prefill-specialised chip; the Groq-derived <strong>LPX</strong> rack targets low-latency decode. Together with NVIDIA Dynamo, this bakes the prefill/decode split of Chapter 19 into silicon.</li>
+<li><strong>Next:</strong> Rubin Ultra in Kyber NVL576 racks (~600 kW, 2027) and Feynman (2028). AMD's MI455X (432 GB HBM4) and Helios rack arrive later in 2026; Google's TPU v7 Ironwood and AWS Trainium3 are in large-scale deployment.</li>
+</ul>
+<h3>8. Power and capital are the binding constraints</h3>
+<p>Hyperscaler capex exceeds $300 billion for 2026 across the largest four US companies alone; lab compute commitments run to hundreds of billions more; gigawatt campuses and on-site generation are standard plans. Both Anthropic and OpenAI are preparing for public listings (Anthropic possibly before the end of 2026; OpenAI expected in 2027, per press reports). The debate about whether revenue growth will justify the build-out continues.</p>
+<h2>What to watch next</h2>
+<ul>
+<li>Whether Gemini 3.5 Pro / Gemini 4 and further GPT-6 and Claude 5.x releases keep the monthly pace.</li>
+<li>Independent measurements of agent reliability on long tasks (METR time horizons, real-world deployment data) versus vendor benchmarks.</li>
+<li>Real-world Rubin performance per dollar once independent benchmarks appear.</li>
+<li>Policy responses to autonomous cyber capability, and export-control changes.</li>
+<li>Whether open-weight models close the remaining gap, and how licences evolve.</li>
+<li>Diffusion LMs, new attention variants, and continual-learning methods that could change serving economics.</li>
+</ul>
+<h2>How to stay current (a weekly routine)</h2>
+<ol>
+<li><strong>Primary sources first:</strong> lab blogs and model cards (Anthropic, OpenAI, Google DeepMind, Meta, DeepSeek, Qwen), NVIDIA and AMD technical blogs.</li>
+<li><strong>Independent measurement:</strong> Artificial Analysis, Epoch AI, LMArena, SWE-bench and Terminal-Bench leaderboards, METR.</li>
+<li><strong>Papers:</strong> arXiv cs.CL / cs.LG via Hugging Face Daily Papers; read one infrastructure paper a week.</li>
+<li><strong>Newsletters and podcasts:</strong> SemiAnalysis, Interconnects (Nathan Lambert), Import AI (Jack Clark), Latent Space, Simon Willison's blog.</li>
+<li><strong>Code:</strong> watch the release notes of vLLM, SGLang, PyTorch, TorchTitan, Megatron and Dynamo; new features there tell you what production teams need.</li>
+</ol>
+<h2>Sources for this chapter</h2>
+<ul>
+<li><a href="https://www.theregister.com/ai-and-ml/2026/09/23/frontier-ai-keeps-racing-despite-calls-to-slow-down/5298448">The Register, <em>Frontier AI keeps racing despite calls to slow down</em> (23 September 2026)</a></li>
+<li><a href="https://www.anthropic.com/news/fable-mythos-access">Anthropic, Fable and Mythos access statement</a></li>
+<li><a href="https://www.anthropic.com/glasswing">Anthropic, Project Glasswing</a></li>
+<li><a href="https://www.dutchstartup.ai/en/news/four-major-ai-labs-launch-new-models-in-the-first-week-of-september-2026">dutchstartup.ai, <em>Four major AI labs launch new models in the first week of September 2026</em></a></li>
+<li><a href="https://www.digitalapplied.com/blog/ai-model-releases-september-2026-tracker">Digital Applied, <em>AI Model Releases: September 2026 Tracker</em></a></li>
+<li><a href="https://techcrunch.com/2026/07/21/google-releases-three-new-gemini-models-but-no-3-5-pro/">TechCrunch, <em>Google releases three new Gemini models, but no 3.5 Pro</em> (21 July 2026)</a></li>
+<li><a href="https://en.wikipedia.org/wiki/2026_in_artificial_intelligence">Wikipedia, <em>2026 in artificial intelligence</em></a></li>
+<li><a href="https://www.morphllm.com/best-open-source-coding-model-2026">Morph, <em>Best Open-Source Coding Model 2026</em></a></li>
+<li><a href="https://wavect.io/blog/open-weight-llm-comparison-2026/">Wavect, <em>Best Open-Weight LLMs 2026</em></a></li>
+<li><a href="https://developer.nvidia.com/blog/nvidia-vera-rubin-pod-seven-chips-five-rack-scale-systems-one-ai-supercomputer/">NVIDIA Technical Blog, <em>Vera Rubin POD</em></a></li>
+<li><a href="https://www.siliconreport.com/nvidia-vera-rubin-everything-we-know-33727d4d">SiliconReport, <em>Nvidia Vera Rubin Explained</em></a></li>
+<li><a href="https://www.moduledge.com/blog/nvidia-vera-rubin">ModulEdge, <em>Nvidia Vera Rubin: Data Center Impact</em></a></li>
+<li><a href="https://digital-strategy.ec.europa.eu/en/news/ai-omnibus-enters-force">European Commission, <em>AI Omnibus enters into force</em></a></li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sequence Models: From RNNs to Attention · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="7">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Sequence Models: From RNNs to Attention</h1>
+<p class="lede">Language, audio, time series and code are sequences. This chapter traces how models learned to handle them, from recurrent networks to the attention mechanism, and explains exactly which bottleneck the Transformer removed.</p>
+</header>
+
+<h2>The problem</h2>
+<p>A sequence model must handle inputs of varying length and let earlier elements influence later ones. "The keys to the cabinet <strong>are</strong> on the table": the verb must agree with "keys", four words back.</p>
+<h2>Recurrent neural networks (RNNs)</h2>
+<p>An RNN reads one token at a time and carries a <strong>hidden state</strong> <code>h</code> forward, a running summary of everything seen so far:</p>
+<div class="math">hₜ = tanh(W_h · hₜ₋₁ + W_x · xₜ + b)
+yₜ = W_y · hₜ</div>
+
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    x1[&quot;x1&quot;] --&gt; R1[&quot;RNN cell&quot;]
+    R1 --&gt;|&quot;h1&quot;| R2[&quot;RNN cell&quot;]
+    x2[&quot;x2&quot;] --&gt; R2
+    R2 --&gt;|&quot;h2&quot;| R3[&quot;RNN cell&quot;]
+    x3[&quot;x3&quot;] --&gt; R3
+    R3 --&gt;|&quot;h3&quot;| R4[&quot;...&quot;]
+    R1 --&gt; y1[&quot;y1&quot;]
+    R2 --&gt; y2[&quot;y2&quot;]
+    R3 --&gt; y3[&quot;y3&quot;]
+</pre>
+</figure>
+<pre><code class="language-python">import torch, torch.nn as nn
+
+class CharRNN(nn.Module):
+    def __init__(self, vocab, hidden=256):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, hidden)
+        self.rnn = nn.LSTM(hidden, hidden, num_layers=2, batch_first=True)
+        self.out = nn.Linear(hidden, vocab)
+    def forward(self, idx, state=None):
+        h, state = self.rnn(self.emb(idx), state)
+        return self.out(h), state
+</code></pre>
+<h3>Two fatal problems</h3>
+<ol>
+<li><strong>Vanishing and exploding gradients.</strong> Backpropagating through 100 time steps multiplies 100 Jacobians together. The product shrinks to zero or blows up, so the network cannot learn long-range dependencies.</li>
+<li><strong>Sequential computation.</strong> Step t needs step t−1. You cannot parallelise across the sequence, so GPUs sit mostly idle. This is an <strong>infrastructure</strong> problem, and it is the one that ultimately killed RNNs.</li>
+</ol>
+<h2>LSTMs and GRUs</h2>
+<p>The <strong>LSTM</strong> (1997) adds a separate <em>cell state</em> with <strong>gates</strong> (small sigmoid layers) that decide what to forget, what to write, and what to output. Because the cell state is updated additively, gradients flow across many steps. The <strong>GRU</strong> (2014) is a simpler variant. LSTMs powered Google Translate, Siri and Alexa speech recognition in the 2010s.</p>
+<h2>Sequence-to-sequence and the bottleneck</h2>
+<p>For translation, an <strong>encoder</strong> RNN reads the source sentence into a final hidden state, and a <strong>decoder</strong> RNN generates the target from it. The problem: the whole sentence must squeeze through one fixed-size vector.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph Encoder
+      e1[&quot;the&quot;] --&gt; e2[&quot;black&quot;] --&gt; e3[&quot;cat&quot;]
+    end
+    e3 --&gt;|&quot;single context vector: the bottleneck&quot;| d1
+    subgraph Decoder
+      d1[&quot;le&quot;] --&gt; d2[&quot;chat&quot;] --&gt; d3[&quot;noir&quot;]
+    end
+</pre>
+</figure>
+<h2>Attention: let the decoder look back</h2>
+<p>Bahdanau et al. (2014) let the decoder, at each step, compute a <strong>weighted average of all encoder states</strong>, with weights based on relevance. To output "chat", it attends mostly to "cat".</p>
+<p>The mechanism in three steps:</p>
+<ol>
+<li><strong>Score</strong>: compare the current decoder state (the <em>query</em>) with every encoder state (the <em>keys</em>).</li>
+<li><strong>Normalise</strong>: softmax the scores into weights that sum to 1.</li>
+<li><strong>Blend</strong>: take the weighted sum of encoder states (the <em>values</em>).</li>
+</ol>
+<pre><code class="language-python">import torch.nn.functional as F
+
+def attention(query, keys, values):
+    # query: (d,)   keys, values: (T, d)
+    scores = keys @ query                 # (T,) dot-product relevance
+    weights = F.softmax(scores, dim=0)    # (T,) sums to 1
+    return weights @ values               # (d,) weighted blend
+</code></pre>
+<p>That function is the seed of the Transformer.</p>
+<h2>"Attention Is All You Need"</h2>
+<p>In 2017, Vaswani et al. asked: if attention is doing the useful work, why keep the recurrence at all? The <strong>Transformer</strong> uses <strong>self-attention</strong>, where every token attends to every other token in the same sequence, and processes all positions <strong>in parallel</strong>.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>RNN / LSTM</th>
+<th>Transformer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Path length between distant tokens</td>
+<td>O(n) steps</td>
+<td>O(1): direct attention</td>
+</tr>
+<tr>
+<td>Parallel across sequence (training)</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Compute per layer</td>
+<td>O(n·d²)</td>
+<td>O(n²·d + n·d²)</td>
+</tr>
+<tr>
+<td>Memory of the past at inference</td>
+<td>Fixed-size state</td>
+<td>Grows with context (KV cache)</td>
+</tr>
+<tr>
+<td>GPU utilisation</td>
+<td>Poor</td>
+<td>Excellent</td>
+</tr>
+</tbody>
+</table>
+<p>Note the last two rows. The Transformer's weakness is the mirror image of the RNN's: attention cost grows <strong>quadratically</strong> with sequence length, and at inference it keeps a cache that <strong>grows linearly</strong>. That trade-off is why modern research has partially brought recurrence back in the form of <strong>state-space models</strong> and <strong>linear attention</strong> (Mamba, Gated DeltaNet), mixed with attention in hybrid architectures (Chapter 11).</p>
+<h2>Other sequence domains</h2>
+<ul>
+<li><strong>Speech</strong>: Whisper (2022) is an encoder-decoder Transformer on audio spectrograms.</li>
+<li><strong>Time series</strong>: gradient boosting and simple models remain strong; foundation models (TimesFM, Chronos) are emerging.</li>
+<li><strong>Biology</strong>: proteins and DNA are sequences; AlphaFold 2 (2020) and protein language models use attention.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>Christopher Olah, <em>Understanding LSTM Networks</em> (blog, 2015).</li>
+<li>Jay Alammar, <em>Visualizing A Neural Machine Translation Model</em> (blog).</li>
+<li>Karpathy, <em>The Unreasonable Effectiveness of Recurrent Neural Networks</em> (blog, 2015).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

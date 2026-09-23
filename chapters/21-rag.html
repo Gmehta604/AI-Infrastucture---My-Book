@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Retrieval, Vector Search and RAG · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="21">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Retrieval, Vector Search and RAG</h1>
+<p class="lede">Models know what was in their training data, up to a cutoff date, and nothing about your company's documents. Retrieval-augmented generation (RAG) fetches relevant information at query time and puts it in the prompt. It is the most deployed enterprise AI pattern, and most of its failures are retrieval failures, not model failures.</p>
+</header>
+
+<h2>The RAG pipeline</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    subgraph Ingest[&quot;Ingestion (offline, continuous)&quot;]
+      S[&quot;Sources: PDFs, wikis, tickets, databases, Slack, code&quot;] --&gt; X[&quot;Parse and extract text, tables, images&quot;]
+      X --&gt; C[&quot;Chunk (with metadata: source, date, permissions)&quot;]
+      C --&gt; E[&quot;Embed each chunk&quot;]
+      E --&gt; V[(&quot;Vector index + keyword index&quot;)]
+    end
+    subgraph Query[&quot;Query time (online)&quot;]
+      Q[&quot;User question&quot;] --&gt; RW[&quot;Query rewriting / expansion&quot;]
+      RW --&gt; H[&quot;Hybrid search: vectors + BM25&quot;]
+      V --&gt; H
+      H --&gt; F[&quot;Filter by permissions and metadata&quot;]
+      F --&gt; RR[&quot;Rerank top 50 → top 5 (cross-encoder)&quot;]
+      RR --&gt; P[&quot;Build prompt with cited context&quot;]
+      P --&gt; L[&quot;LLM generates answer with citations&quot;]
+    end
+</pre>
+</figure>
+<h2>Chunking</h2>
+<p>Chunks are what you retrieve. Too small and they lack context; too large and they dilute relevance and waste tokens.</p>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fixed size with overlap (e.g., 500 tokens, 50 overlap)</td>
+<td>Simple baseline</td>
+</tr>
+<tr>
+<td>Recursive / structural</td>
+<td>Split by headings, paragraphs, sentences; respect document structure</td>
+</tr>
+<tr>
+<td>Semantic</td>
+<td>Split where embedding similarity between sentences drops</td>
+</tr>
+<tr>
+<td><strong>Contextual chunking</strong></td>
+<td>Prepend an LLM-written summary of where the chunk sits in its document (Anthropic's <em>Contextual Retrieval</em>, 2024, cut retrieval failures by about half with reranking)</td>
+</tr>
+<tr>
+<td>Parent–child</td>
+<td>Retrieve small chunks, feed the larger parent section to the model</td>
+</tr>
+<tr>
+<td>Late chunking</td>
+<td>Embed the whole document with a long-context model, then pool per chunk</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-python">def chunk_by_headings(markdown_text, max_chars=2000, overlap=200):
+    sections, cur, title = [], [], &quot;Intro&quot;
+    for line in markdown_text.splitlines():
+        if line.startswith(&quot;#&quot;):
+            if cur: sections.append((title, &quot;\n&quot;.join(cur)))
+            title, cur = line.lstrip(&quot;# &quot;).strip(), []
+        else:
+            cur.append(line)
+    if cur: sections.append((title, &quot;\n&quot;.join(cur)))
+    chunks = []
+    for title, body in sections:
+        for i in range(0, max(len(body), 1), max_chars - overlap):
+            chunks.append({&quot;title&quot;: title, &quot;text&quot;: f&quot;{title}\n{body[i:i + max_chars]}&quot;})
+    return chunks
+</code></pre>
+<p><strong>Parsing is often the hardest part.</strong> PDFs with tables, multi-column layouts and scanned pages need proper tools (Docling, Unstructured, LlamaParse, Azure Document Intelligence, or VLM-based parsing, Chapter 14).</p>
+<h2>Embeddings and similarity search</h2>
+<p>Each chunk becomes a vector (Chapter 8). At query time, embed the question and find nearest neighbours by cosine similarity. With millions of vectors, exact search is too slow, so we use <strong>approximate nearest neighbour (ANN)</strong> indexes.</p>
+<table>
+<thead>
+<tr>
+<th>Index</th>
+<th>How it works</th>
+<th>Trade-offs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Flat (brute force)</td>
+<td>Compare against everything</td>
+<td>Exact; fine up to ~1M vectors on GPU</td>
+</tr>
+<tr>
+<td><strong>HNSW</strong></td>
+<td>Multi-layer proximity graph; greedy search from coarse to fine layers</td>
+<td>Fast and accurate; memory-hungry; the default in most vector DBs</td>
+</tr>
+<tr>
+<td><strong>IVF</strong></td>
+<td>k-means clusters; search only the nearest few clusters</td>
+<td>Tunable speed/recall via <code>nprobe</code></td>
+</tr>
+<tr>
+<td><strong>PQ / scalar / binary quantization</strong></td>
+<td>Compress vectors (e.g., 1024 floats → 64 bytes)</td>
+<td>Huge memory savings; some recall loss; rescore top results</td>
+</tr>
+<tr>
+<td>DiskANN</td>
+<td>Graph index on SSD</td>
+<td>Billions of vectors cheaply</td>
+</tr>
+</tbody>
+</table>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    L2[&quot;HNSW layer 2: few nodes, long jumps&quot;] --&gt; L1[&quot;Layer 1: more nodes&quot;]
+    L1 --&gt; L0[&quot;Layer 0: all vectors, short links&quot;]
+    Q[&quot;Query vector&quot;] --&gt;|&quot;enter at top&quot;| L2
+    L0 --&gt; K[&quot;k nearest neighbours&quot;]
+</pre>
+</figure>
+<pre><code class="language-python">import faiss, numpy as np
+d = 384
+xb = np.random.rand(200_000, d).astype(&quot;float32&quot;); faiss.normalize_L2(xb)
+index = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)   # 32 links per node
+index.hnsw.efConstruction = 200
+index.add(xb)
+index.hnsw.efSearch = 64                                         # recall/speed knob
+xq = xb[:5]
+scores, ids = index.search(xq, 10)
+print(ids[:, 0])        # each query finds itself first
+</code></pre>
+<p><strong>Vector databases:</strong> pgvector (Postgres extension; often all you need), Qdrant, Weaviate, Milvus, Pinecone, Elasticsearch/OpenSearch, Vespa, Turbopuffer, LanceDB, Chroma. Choose based on scale, filtering needs, hybrid search support and whether you already run Postgres.</p>
+<h2>Hybrid search and reranking</h2>
+<p>Embeddings capture meaning but miss exact terms: product codes, error messages, names. <strong>BM25</strong> keyword search catches those. Combine both with <strong>reciprocal rank fusion (RRF)</strong>, then <strong>rerank</strong> with a cross-encoder that reads the query and each candidate together, which is far more accurate than comparing separate embeddings.</p>
+<pre><code class="language-python">from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer, CrossEncoder
+import numpy as np
+
+docs = [c[&quot;text&quot;] for c in chunks]
+bm25 = BM25Okapi([d.lower().split() for d in docs])
+emb = SentenceTransformer(&quot;BAAI/bge-small-en-v1.5&quot;)
+D = emb.encode(docs, normalize_embeddings=True)
+reranker = CrossEncoder(&quot;BAAI/bge-reranker-base&quot;)
+
+def rrf(rankings, k=60):
+    scores = {}
+    for ranking in rankings:
+        for rank, doc_id in enumerate(ranking):
+            scores[doc_id] = scores.get(doc_id, 0) + 1 / (k + rank + 1)
+    return sorted(scores, key=scores.get, reverse=True)
+
+def search(query, top_k=5):
+    dense = np.argsort(-(D @ emb.encode(query, normalize_embeddings=True)))[:50]
+    sparse = np.argsort(-bm25.get_scores(query.lower().split()))[:50]
+    candidates = rrf([dense.tolist(), sparse.tolist()])[:30]
+    scores = reranker.predict([(query, docs[i]) for i in candidates])
+    return [candidates[i] for i in np.argsort(-scores)[:top_k]]
+</code></pre>
+<h2>Generation with grounding</h2>
+<pre><code class="language-python">def answer(query, llm):
+    hits = search(query)
+    context = &quot;\n\n&quot;.join(f&quot;[{n+1}] {docs[i]}&quot; for n, i in enumerate(hits))
+    prompt = f&quot;&quot;&quot;Answer using ONLY the sources below. Cite sources like [1].
+If the sources do not contain the answer, say &quot;I don't know based on the available documents.&quot;
+
+Sources:
+{context}
+
+Question: {query}&quot;&quot;&quot;
+    return llm(prompt)
+</code></pre>
+<h2>Advanced patterns</h2>
+<ul>
+<li><strong>Query rewriting:</strong> turn "what about for contractors?" into a standalone question using chat history; generate multiple query variants; HyDE (embed a hypothetical answer).</li>
+<li><strong>Agentic RAG:</strong> the model decides when and what to search, iterates, and uses tools (Chapter 22). "Deep research" products are agentic RAG over the web.</li>
+<li><strong>GraphRAG:</strong> build a knowledge graph of entities and relations for questions that span many documents ("what are the main themes across all incident reports?").</li>
+<li><strong>Long context vs RAG:</strong> with 1M-token windows, you can sometimes skip retrieval and paste the whole corpus. It's simpler but costs far more per query, and quality degrades on very long inputs. Use prompt caching plus long context for small, stable corpora; RAG for large or changing ones.</li>
+<li><strong>Permissions:</strong> enforce document-level access control at retrieval time. Leaking HR documents through a chatbot is a classic failure.</li>
+<li><strong>Freshness:</strong> incremental re-indexing via change-data-capture from source systems.</li>
+</ul>
+<h2>Evaluating RAG</h2>
+<p>Evaluate retrieval and generation separately.</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Metric</th>
+<th>How</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Retrieval</td>
+<td>Recall@k, MRR, NDCG</td>
+<td>Labelled (question, relevant chunk) pairs</td>
+</tr>
+<tr>
+<td>Generation</td>
+<td>Faithfulness / groundedness</td>
+<td>Does every claim appear in the retrieved context? (LLM judge)</td>
+</tr>
+<tr>
+<td>Generation</td>
+<td>Answer correctness</td>
+<td>Compare with reference answers</td>
+</tr>
+<tr>
+<td>End to end</td>
+<td>Task success, citation accuracy, "I don't know" rate</td>
+<td>Human review of samples</td>
+</tr>
+</tbody>
+</table>
+<p>Tools: RAGAS, TruLens, DeepEval, Arize Phoenix, LangSmith, Braintrust. <strong>Build a golden dataset of 100–300 real questions first</strong>; it is the most valuable asset in any RAG project.</p>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project 3: "The chatbot makes things up about our docs"</h3>
+<p><strong>Business problem:</strong> a company's support bot answers from its documentation but hallucinates policies, and customers screenshot the wrong answers.</p>
+<ol>
+<li>Ingest a real docs site (e.g., the Kubernetes or Stripe docs) with structure-aware chunking.</li>
+<li>Build a golden set of 150 questions with the correct source section for each.</li>
+<li>Compare: dense-only, BM25-only, hybrid, hybrid + reranker, + contextual chunking. Report Recall@5 for each.</li>
+<li>Add grounding instructions and a faithfulness judge; measure hallucination rate before and after.</li>
+<li>Deliverable: a dashboard of retrieval recall, faithfulness and cost per query, plus the configuration you'd ship.</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Lewis et al., <em>Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks</em> (2020).</li>
+<li>Anthropic, <em>Introducing Contextual Retrieval</em> (2024).</li>
+<li>Malkov and Yashunin, <em>HNSW</em> (2016); Jégou et al., <em>Product Quantization for Nearest Neighbor Search</em> (2011).</li>
+<li>Microsoft Research, <em>GraphRAG</em> (2024).</li>
+<li>Jason Liu's writing on RAG systems and evaluation; the MTEB leaderboard for choosing embedding models.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

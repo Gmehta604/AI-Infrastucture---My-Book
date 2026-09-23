@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Evaluation and Observability · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="23">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Evaluation and Observability</h1>
+<p class="lede">You cannot improve what you cannot measure, and LLM systems are unusually hard to measure: outputs are open-ended, non-deterministic and change whenever a prompt, model version or retrieval index changes. Mature AI teams treat evals like tests and traces like logs. This chapter shows how.</p>
+</header>
+
+<h2>Three kinds of evaluation</h2>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Question</th>
+<th>Examples</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Capability benchmarks</strong></td>
+<td>How good is the model in general?</td>
+<td>MMLU-Pro, GPQA Diamond, AIME, SWE-bench, Humanity's Last Exam, ARC-AGI, LMArena</td>
+</tr>
+<tr>
+<td><strong>Application evals</strong></td>
+<td>Does <em>my system</em> do <em>my task</em> well?</td>
+<td>Your golden datasets, rubrics, task success rates</td>
+</tr>
+<tr>
+<td><strong>Online / production metrics</strong></td>
+<td>Is it working for real users right now?</td>
+<td>Thumbs up/down, resolution rate, escalations, latency, cost</td>
+</tr>
+</tbody>
+</table>
+<p>Public benchmarks help choose candidate models. Only application evals tell you what to ship.</p>
+<h2>Why public benchmarks mislead</h2>
+<ul>
+<li><strong>Contamination:</strong> test questions leak into training data.</li>
+<li><strong>Saturation:</strong> once top models score 90%+, the benchmark stops distinguishing them.</li>
+<li><strong>Mismatch:</strong> your task isn't multiple-choice trivia.</li>
+<li><strong>Harness sensitivity:</strong> prompt format, number of attempts, and tool access change scores by many points. Compare only numbers run under the same harness.</li>
+<li><strong>Arena gaming:</strong> preference leaderboards reward style (length, formatting) as well as substance.</li>
+</ul>
+<h2>Building application evals</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Collect real inputs (logs, user research)&quot;] --&gt; B[&quot;Write expected outputs or grading criteria&quot;]
+    B --&gt; C[&quot;Choose graders: code checks, LLM judge, human&quot;]
+    C --&gt; D[&quot;Run system on eval set&quot;]
+    D --&gt; E[&quot;Score, slice by category, compare to baseline&quot;]
+    E --&gt; F{&quot;Regression?&quot;}
+    F --&gt;|&quot;yes&quot;| G[&quot;Block the change&quot;]
+    F --&gt;|&quot;no&quot;| H[&quot;Ship; add new failure cases to the set&quot;]
+    H --&gt; A
+</pre>
+</figure>
+<h3>Graders, from most to least reliable</h3>
+<ol>
+<li><strong>Deterministic code checks:</strong> exact match, regex, JSON schema validity, unit tests passing, SQL returns the right rows.</li>
+<li><strong>Reference comparison:</strong> similarity to a gold answer, or an LLM judge comparing with the gold answer.</li>
+<li><strong>LLM-as-judge with a rubric:</strong> a strong model scores against explicit criteria.</li>
+<li><strong>Human review:</strong> gold standard, slow and expensive; use it to calibrate the judges.</li>
+</ol>
+<pre><code class="language-python">import json
+from openai import OpenAI
+client = OpenAI()
+
+RUBRIC = &quot;&quot;&quot;You are grading a customer-support answer.
+Score each criterion 1 (pass) or 0 (fail):
+- correct: the answer agrees with the reference answer on all facts
+- grounded: every claim is supported by the provided context
+- complete: it addresses every part of the question
+- tone: polite and concise
+Return JSON: {&quot;correct&quot;:0|1,&quot;grounded&quot;:0|1,&quot;complete&quot;:0|1,&quot;tone&quot;:0|1,&quot;reason&quot;:&quot;...&quot;}&quot;&quot;&quot;
+
+def judge(question, context, reference, answer, model=&quot;gpt-5.5-mini&quot;):
+    msg = f&quot;{RUBRIC}\n\nQuestion: {question}\nContext: {context}\nReference: {reference}\nAnswer: {answer}&quot;
+    out = client.chat.completions.create(model=model, temperature=0,
+            response_format={&quot;type&quot;: &quot;json_object&quot;},
+            messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: msg}])
+    return json.loads(out.choices[0].message.content)
+
+def run_eval(system, dataset):
+    rows = []
+    for ex in dataset:
+        ans, ctx = system(ex[&quot;question&quot;])
+        rows.append({**judge(ex[&quot;question&quot;], ctx, ex[&quot;reference&quot;], ans), &quot;category&quot;: ex[&quot;category&quot;]})
+    for key in [&quot;correct&quot;, &quot;grounded&quot;, &quot;complete&quot;, &quot;tone&quot;]:
+        print(key, sum(r[key] for r in rows) / len(rows))
+    return rows
+</code></pre>
+<p>(Model names are placeholders; use whatever judge model you have access to.)</p>
+<p><strong>LLM-judge pitfalls:</strong> position bias (prefers the first option; randomise order), verbosity bias (prefers longer answers), self-preference (prefers its own family's style). Use binary or low-cardinality scores with explicit criteria, and <strong>measure judge agreement with humans</strong> on 50–100 examples before trusting it.</p>
+<h3>Statistics matter</h3>
+<p>With 100 examples, a pass rate of 80% has a 95% confidence interval of roughly ±8 points. Don't celebrate a 2-point improvement on 100 examples. For non-deterministic agents, run each task several times and report pass@1 averaged, plus pass^k (succeeds on all k tries) for reliability.</p>
+<h2>Evals in CI</h2>
+<p>Treat prompts, retrieval settings and model versions like code. On every change, run the eval suite and block merges that regress.</p>
+<pre><code class="language-yaml"># .github/workflows/llm-evals.yml
+name: llm-evals
+on: [pull_request]
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: &quot;3.12&quot; }
+      - run: pip install -r requirements.txt
+      - run: python evals/run.py --dataset evals/golden.jsonl --out results.json
+        env: { OPENAI_API_KEY: &quot;${{ secrets.OPENAI_API_KEY }}&quot; }
+      - run: python evals/compare.py --baseline evals/baseline.json --current results.json --max-drop 0.02
+</code></pre>
+<p>Tools: promptfoo, Braintrust, LangSmith, Arize Phoenix, DeepEval, Inspect (UK AI Security Institute; widely used for safety and capability evals), OpenAI Evals.</p>
+<h2>Observability: tracing LLM systems</h2>
+<p>A single user request in an agentic RAG system may involve a query rewrite, three searches, a rerank, two model calls and four tool calls. When the answer is wrong or slow, you need the <strong>trace</strong>.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    R[&quot;Trace: user request 7f3a (4.2 s, $0.031)&quot;] --&gt; S1[&quot;span: rewrite_query (llm, 310 ms, 420 tok)&quot;]
+    R --&gt; S2[&quot;span: hybrid_search (95 ms, 50 hits)&quot;]
+    R --&gt; S3[&quot;span: rerank (120 ms)&quot;]
+    R --&gt; S4[&quot;span: generate_answer (llm, 3.4 s, 6,100 in / 380 out tok)&quot;]
+    S4 --&gt; S5[&quot;span: tool call lookup_order (220 ms)&quot;]
+</pre>
+</figure>
+<p>Use <strong>OpenTelemetry</strong> with the GenAI semantic conventions (<code>gen_ai.request.model</code>, <code>gen_ai.usage.input_tokens</code>, etc.) so traces flow to any backend: Langfuse, Arize Phoenix, LangSmith, Datadog, Honeycomb, Grafana Tempo.</p>
+<pre><code class="language-python">from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+trace.set_tracer_provider(TracerProvider())
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+tracer = trace.get_tracer(&quot;rag-service&quot;)
+
+def traced_llm_call(model, messages):
+    with tracer.start_as_current_span(&quot;chat &quot; + model) as span:
+        span.set_attribute(&quot;gen_ai.request.model&quot;, model)
+        resp = client.chat.completions.create(model=model, messages=messages)
+        span.set_attribute(&quot;gen_ai.usage.input_tokens&quot;, resp.usage.prompt_tokens)
+        span.set_attribute(&quot;gen_ai.usage.output_tokens&quot;, resp.usage.completion_tokens)
+        return resp
+</code></pre>
+<h2>What to monitor in production</h2>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Metrics</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Serving</td>
+<td>TTFT, TPOT, p95/p99 latency, error rates, queue depth, GPU utilisation, KV cache usage, prefix-cache hit rate</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Tokens and $ per request, per feature, per customer; cost anomalies</td>
+</tr>
+<tr>
+<td>Quality</td>
+<td>Online judge scores on sampled traffic, user feedback, refusal rate, "I don't know" rate, escalation to humans</td>
+</tr>
+<tr>
+<td>Safety</td>
+<td>Prompt-injection detections, PII leaks, policy violations</td>
+</tr>
+<tr>
+<td>Drift</td>
+<td>Changes in input topics or length distributions; provider model version changes</td>
+</tr>
+</tbody>
+</table>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project 6: "A prompt change broke production and nobody noticed"</h3>
+<p><strong>Business problem:</strong> a team edited a system prompt; answer accuracy on refund questions silently dropped for two weeks.</p>
+<ol>
+<li>Take your RAG system from Chapter 21. Create a 200-example golden set with categories.</li>
+<li>Add OpenTelemetry tracing with Langfuse or Phoenix; build a dashboard of cost, latency and judge scores.</li>
+<li>Wire the eval suite into GitHub Actions with a regression threshold.</li>
+<li>Demonstrate: introduce a subtle prompt regression in a pull request and show CI blocking it, with the failing category highlighted.</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Hamel Husain, <em>Your AI Product Needs Evals</em> and related posts (hamel.dev).</li>
+<li>Anthropic, <em>Demystifying evals for AI agents</em> (2025); OpenAI evals guides.</li>
+<li>Zheng et al., <em>Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena</em> (2023).</li>
+<li>OpenTelemetry GenAI semantic conventions.</li>
+<li>Eugene Yan, <em>Patterns for Building LLM-based Systems &amp; Products</em> (blog).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

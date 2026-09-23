@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Data Centers, Power and the Economics of Compute · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="25">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Data Centers, Power and the Economics of Compute</h1>
+<p class="lede">AI has turned into a heavy industry. The binding constraints in 2026 are not only chips but electricity, cooling, transformers (the electrical kind), land and capital. Understanding this layer explains the headlines about gigawatt campuses and hundred-billion-dollar deals.</p>
+</header>
+
+<h2>From server to campus</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;GPU (1-2 kW for Blackwell-class)&quot;] --&gt; B[&quot;Compute tray (4 GPUs + 2 CPUs)&quot;]
+    B --&gt; C[&quot;Rack: NVL72 (72 GPUs, ~120-140 kW)&quot;]
+    C --&gt; D[&quot;Pod / scalable unit (e.g., 8-16 racks + network)&quot;]
+    D --&gt; E[&quot;Data hall (tens of MW)&quot;]
+    E --&gt; F[&quot;Campus (hundreds of MW to multiple GW)&quot;]
+</pre>
+</figure>
+<table>
+<thead>
+<tr>
+<th>Unit</th>
+<th>Power</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>H100 SXM GPU</td>
+<td>~700 W</td>
+<td>8 per HGX server (~10 kW)</td>
+</tr>
+<tr>
+<td>B200 / B300 GPU</td>
+<td>~1,000–1,400 W</td>
+<td>Liquid cooling standard at rack scale</td>
+</tr>
+<tr>
+<td>Traditional enterprise rack</td>
+<td>5–15 kW</td>
+<td>Air-cooled</td>
+</tr>
+<tr>
+<td>GB200 / GB300 NVL72 rack</td>
+<td>~120–140 kW</td>
+<td>Direct-to-chip liquid cooling</td>
+</tr>
+<tr>
+<td>Vera Rubin NVL72 rack (2026)</td>
+<td>~190–230 kW (reported)</td>
+<td>Fanless, fully liquid-cooled trays</td>
+</tr>
+<tr>
+<td>Rubin Ultra Kyber NVL576 rack (2027)</td>
+<td>~600 kW</td>
+<td>800 V DC power distribution</td>
+</tr>
+<tr>
+<td>Frontier training campus</td>
+<td>1–5 GW</td>
+<td>Comparable to a large city's demand</td>
+</tr>
+</tbody>
+</table>
+<p>A useful conversion: <strong>1 GW ≈ 400,000–600,000 Blackwell-class GPUs</strong> once you include CPUs, networking, cooling and other facility overhead (roughly 1.7–2.5 kW per GPU all-in).</p>
+<h2>Power</h2>
+<ul>
+<li><strong>PUE (power usage effectiveness)</strong> = total facility power ÷ IT power. Modern liquid-cooled AI facilities target about 1.1–1.3.</li>
+<li><strong>Grid interconnection</strong> is the longest lead item: waiting times for large new connections run several years in many US regions. Hence behind-the-meter generation (on-site gas turbines), campuses near existing power plants, and deals for nuclear power (restarts of shuttered plants, long-term PPAs, small modular reactor agreements).</li>
+<li><strong>Training load swings</strong>: thousands of GPUs pausing for a checkpoint or synchronising cause megawatt-scale power fluctuations that can stress the grid. Operators smooth this with batteries and software (NVIDIA added power-smoothing features to GB300).</li>
+<li><strong>800 V DC</strong> distribution, promoted by NVIDIA and partners from 2025, reduces copper and conversion losses for racks approaching 1 MW.</li>
+</ul>
+<h2>Cooling</h2>
+<p>Air cooling tops out around 40–50 kW per rack. AI racks use:</p>
+<ul>
+<li><strong>Direct-to-chip liquid cooling:</strong> cold plates on GPUs and CPUs; coolant distribution units (CDUs) per row.</li>
+<li><strong>Rear-door heat exchangers</strong> for mixed deployments.</li>
+<li><strong>Immersion cooling:</strong> servers submerged in dielectric fluid; niche but growing.</li>
+<li><strong>Water use</strong> is a public concern; closed-loop systems and dry coolers reduce consumption.</li>
+</ul>
+<h2>Networking at scale</h2>
+<p>A 100,000-GPU cluster needs hundreds of thousands of optical transceivers and tens of thousands of switches. Innovations: co-packaged optics (NVIDIA Spectrum-X/Quantum-X Photonics), Ultra Ethernet for AI, multi-site training across data centers connected by long-haul fibre (used by Google and others, and discussed by several labs as single sites hit power limits).</p>
+<h2>The economics</h2>
+<h3>Capital expenditure</h3>
+<p>The four largest US hyperscalers (Microsoft, Alphabet, Amazon, Meta) together guided to well over <strong>$300 billion</strong> of capital expenditure for 2026, mostly AI infrastructure, and multi-year commitments across the industry (OpenAI's Stargate partnerships with Oracle, SoftBank and others; Anthropic's compute deals with Google, Amazon and Microsoft/NVIDIA; xAI's Colossus clusters) run to hundreds of billions more. Check current figures; they are revised every quarter.</p>
+<h3>Total cost of ownership (TCO) of a GPU</h3>
+<pre><code class="language-python">def gpu_tco_per_hour(capex_per_gpu=40_000, years=5, power_kw=1.2, pue=1.25,
+                     usd_per_kwh=0.08, opex_frac=0.10, utilisation=0.7):
+    hours = years * 365 * 24
+    capex_h = capex_per_gpu / hours                          # straight-line depreciation
+    power_h = power_kw * pue * usd_per_kwh
+    opex_h = capex_per_gpu * opex_frac / (365 * 24)          # networking, facility, staff share per year
+    return (capex_h + power_h + opex_h) / utilisation         # cost per *useful* hour
+
+print(f&quot;${gpu_tco_per_hour():.2f} per useful GPU-hour&quot;)
+print(f&quot;${gpu_tco_per_hour(utilisation=0.35):.2f} at 35% utilisation&quot;)
+</code></pre>
+<p>The lesson in that code: <strong>utilisation dominates</strong>. Depreciation schedules matter too; whether AI GPUs should be depreciated over 3 or 6 years is an active debate among investors, because each generation makes the last one less competitive per token.</p>
+<h3>The token economy</h3>
+<ul>
+<li>Price for a fixed capability level has fallen roughly <strong>10× per year</strong> or faster (GPT-4-level quality cost ~$37 per million tokens blended in 2023, and cents by 2025).</li>
+<li>Yet total spending keeps rising because usage grows faster: reasoning and agents consume orders of magnitude more tokens per task (a Jevons paradox).</li>
+<li>Inference gross margins depend on batching, utilisation, hardware generation, and model efficiency (MoE, quantization), which are exactly the skills in Part IV.</li>
+</ul>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Capex: chips, buildings, power&quot;] --&gt; B[&quot;Compute capacity (GPU-hours)&quot;]
+    B --&gt; C[&quot;Efficiency: MFU, batching, quantization, caching&quot;]
+    C --&gt; D[&quot;Tokens produced&quot;]
+    D --&gt; E[&quot;Revenue: API, subscriptions, enterprise&quot;]
+    E --&gt;|&quot;funds&quot;| A
+    F[&quot;Model efficiency (MoE, distillation)&quot;] --&gt; C
+</pre>
+</figure>
+<h3>Who captures the value?</h3>
+<p>In 2023–2025, most profit went to the hardware layer (NVIDIA's data-center gross margins around 70–75%). Model labs have large revenue growth (both OpenAI and Anthropic reported multi-billion-dollar annualised revenue run-rates by 2025, growing quickly in 2026) but also enormous compute costs. Applications are increasingly valuable where they own workflows and distribution. Whether the full capex build-out earns an adequate return is one of the central debates in finance right now; take both boosters and sceptics seriously and look at usage data.</p>
+<h2>Geopolitics of compute</h2>
+<ul>
+<li><strong>Export controls:</strong> the US restricts sales of advanced AI chips and chipmaking tools to China and some other countries, with rules revised repeatedly since 2022.</li>
+<li><strong>Supply chain concentration:</strong> TSMC (Taiwan) makes nearly all leading AI chips; advanced packaging (CoWoS) and <strong>HBM</strong> (SK hynix, Samsung, Micron) are recurring bottlenecks.</li>
+<li><strong>Sovereign AI:</strong> countries (Saudi Arabia, UAE, India, EU members, Japan, and others) are funding national compute and models.</li>
+<li><strong>China's stack:</strong> Huawei Ascend, domestic HBM efforts, and highly efficient open-weight models developed partly in response to constrained compute.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>SemiAnalysis reports on data centers, power and GPU economics.</li>
+<li>Epoch AI data on training compute, cluster sizes and power.</li>
+<li>IEA, <em>Energy and AI</em> (2025).</li>
+<li>NVIDIA technical blogs on 800 V DC power and Vera Rubin rack design.</li>
+<li>Dwarkesh Patel's podcast interviews with lab leaders and infrastructure builders.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

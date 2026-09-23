@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tokenization and Embeddings · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="8">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Tokenization and Embeddings</h1>
+<p class="lede">A language model never sees text. It sees integers, called tokens, which it immediately turns into vectors, called embeddings. How text becomes tokens affects cost, speed, multilingual fairness and even arithmetic ability.</p>
+</header>
+
+<h2>The pipeline from text to vectors</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;&#x27;Hello, world!&#x27;&quot;] --&gt; B[&quot;Tokenizer&quot;]
+    B --&gt; C[&quot;Token IDs: 9906, 11, 1917, 0&quot;]
+    C --&gt; D[&quot;Embedding lookup (table of vocab x d_model)&quot;]
+    D --&gt; E[&quot;Vectors: 4 x 4096&quot;]
+    E --&gt; F[&quot;Transformer layers&quot;]
+    F --&gt; G[&quot;Logits over vocabulary&quot;]
+    G --&gt; H[&quot;Sample next token ID&quot;]
+    H --&gt; I[&quot;Detokenize to text&quot;]
+</pre>
+</figure>
+<h2>Why not characters or words?</h2>
+<ul>
+<li><strong>Characters</strong>: tiny vocabulary, but sequences become 4–5× longer. Attention costs grow quadratically, so this is expensive.</li>
+<li><strong>Words</strong>: short sequences, but the vocabulary is enormous, and any unseen word ("GPT-6ification") is unknown.</li>
+<li><strong>Subwords</strong> (the answer): common words are single tokens; rare words split into pieces. "unbelievably" → <code>un</code>, <code>believ</code>, <code>ably</code>.</li>
+</ul>
+<h2>Byte-Pair Encoding (BPE)</h2>
+<p>BPE, used by GPT models, Llama 3+, Qwen and most others, learns merges from data:</p>
+<ol>
+<li>Start with bytes (256 base symbols), so any text is representable.</li>
+<li>Count every adjacent pair in the corpus.</li>
+<li>Merge the most frequent pair into a new symbol.</li>
+<li>Repeat until the vocabulary reaches the target size.</li>
+</ol>
+<pre><code class="language-python">from collections import Counter
+
+def train_bpe(text, num_merges):
+    ids = list(text.encode(&quot;utf-8&quot;))
+    merges = {}
+    for i in range(num_merges):
+        pairs = Counter(zip(ids, ids[1:]))
+        if not pairs:
+            break
+        best = max(pairs, key=pairs.get)
+        new_id = 256 + i
+        merges[best] = new_id
+        out, j = [], 0
+        while j &lt; len(ids):                       # replace every occurrence
+            if j &lt; len(ids) - 1 and (ids[j], ids[j + 1]) == best:
+                out.append(new_id); j += 2
+            else:
+                out.append(ids[j]); j += 1
+        ids = out
+    return merges, ids
+
+text = &quot;low lower lowest newer newest &quot; * 50
+merges, ids = train_bpe(text, 20)
+print(len(text.encode()), &quot;bytes -&gt;&quot;, len(ids), &quot;tokens&quot;)
+</code></pre>
+<p>In production you use a fast library:</p>
+<pre><code class="language-python">import tiktoken                                  # OpenAI's BPE
+enc = tiktoken.get_encoding(&quot;o200k_base&quot;)
+ids = enc.encode(&quot;Tokenization affects cost!&quot;)
+print(ids, [enc.decode([i]) for i in ids])
+
+from transformers import AutoTokenizer          # Hugging Face
+tok = AutoTokenizer.from_pretrained(&quot;Qwen/Qwen2.5-7B-Instruct&quot;)
+print(tok(&quot;Tokenization affects cost!&quot;).input_ids)
+</code></pre>
+<p>Other algorithms: <strong>WordPiece</strong> (BERT) and <strong>Unigram / SentencePiece</strong> (T5, Gemma, many multilingual models).</p>
+<h2>Tokenization has real consequences</h2>
+<table>
+<thead>
+<tr>
+<th>Effect</th>
+<th>Why</th>
+<th>Business impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Cost</strong></td>
+<td>APIs bill per token</td>
+<td>English averages ~0.75 words per token; many languages need 2–4× more tokens for the same meaning, so they cost more</td>
+</tr>
+<tr>
+<td><strong>Speed</strong></td>
+<td>Decoding is one token per step</td>
+<td>Fewer tokens = faster responses</td>
+</tr>
+<tr>
+<td><strong>Arithmetic</strong></td>
+<td>"12345" may split as <code>123</code> <code>45</code></td>
+<td>Models historically struggled with digit-level math; many tokenizers now split digits individually</td>
+</tr>
+<tr>
+<td><strong>Code</strong></td>
+<td>Whitespace handling</td>
+<td>Good tokenizers merge runs of spaces</td>
+</tr>
+<tr>
+<td><strong>Glitch tokens</strong></td>
+<td>Tokens that appeared in tokenizer training but rarely in model training</td>
+<td>Strange outputs (the famous "SolidGoldMagikarp")</td>
+</tr>
+</tbody>
+</table>
+<p>Vocabulary sizes have grown: GPT-2 used 50,257 tokens; Llama 3 uses 128,256; GPT-4o's <code>o200k</code> has about 200,000; Gemma uses 256,000. Bigger vocabularies shorten sequences but enlarge the embedding and output layers.</p>
+<p><strong>Special tokens</strong> mark structure: <code>&lt;|begin_of_text|&gt;</code>, <code>&lt;|im_start|&gt;user</code>, tool-call markers, and end-of-sequence. <strong>Chat templates</strong> define how a conversation is laid out in tokens. Getting the template wrong when serving or fine-tuning an open model is one of the most common and silent bugs in the industry.</p>
+<h2>Embeddings</h2>
+<p>An <strong>embedding</strong> is a learned vector for each token. The embedding table is a matrix of shape <code>(vocab_size, d_model)</code>; looking up a token is just selecting a row.</p>
+<pre><code class="language-python">import torch.nn as nn
+emb = nn.Embedding(num_embeddings=128_256, embedding_dim=4096)
+print(emb.weight.numel() / 1e6, &quot;M parameters&quot;)    # 525M in the table alone
+</code></pre>
+<p>During training, tokens used in similar contexts end up with similar vectors. Meaning becomes geometry: directions in the space correspond to concepts like gender, tense or sentiment.</p>
+<h3>Two kinds of embeddings: don't confuse them</h3>
+<ol>
+<li><strong>Token embeddings</strong>: the input layer of an LLM, one per vocabulary entry.</li>
+<li><strong>Text / sentence embeddings</strong>: a single vector for a whole passage, produced by a dedicated <strong>embedding model</strong> (e.g., OpenAI <code>text-embedding-3</code>, Cohere Embed, Voyage, open models like BGE, E5, GTE, Nomic, Qwen3-Embedding). These power semantic search and RAG (Chapter 21).</li>
+</ol>
+<pre><code class="language-python">from sentence_transformers import SentenceTransformer
+m = SentenceTransformer(&quot;BAAI/bge-small-en-v1.5&quot;)
+docs = [&quot;How do I reset my password?&quot;, &quot;Shipping takes 3-5 days.&quot;, &quot;Refund policy for damaged items&quot;]
+q = m.encode(&quot;I forgot my login&quot;, normalize_embeddings=True)
+D = m.encode(docs, normalize_embeddings=True)
+print(D @ q)        # highest score = password doc
+</code></pre>
+<h2>Positional information</h2>
+<p>Attention by itself treats input as an unordered set; "dog bites man" and "man bites dog" would look identical. Models must inject position:</p>
+<ul>
+<li><strong>Learned absolute</strong> position embeddings (GPT-2): a vector per position, added to token embeddings. Cannot extend beyond the trained length.</li>
+<li><strong>Sinusoidal</strong> (original Transformer): fixed sine/cosine patterns.</li>
+<li><strong>RoPE (rotary position embedding)</strong>: rotates query and key vectors by an angle proportional to position, so their dot product depends on <strong>relative</strong> distance. The standard in nearly all modern LLMs. Context-extension tricks (NTK scaling, YaRN) work by adjusting RoPE frequencies.</li>
+<li><strong>ALiBi</strong>: adds a distance-based penalty to attention scores.</li>
+</ul>
+<p>Chapter 9 implements RoPE.</p>
+<h2>Resources</h2>
+<ul>
+<li>Karpathy, <em>Let's build the GPT Tokenizer</em> (YouTube). Implements BPE fully.</li>
+<li>Sennrich et al., <em>Neural Machine Translation of Rare Words with Subword Units</em> (2015).</li>
+<li>Su et al., <em>RoFormer: Enhanced Transformer with Rotary Position Embedding</em> (2021).</li>
+<li>The tiktokenizer web app, to see how text splits.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

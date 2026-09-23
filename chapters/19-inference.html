@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inference and Serving · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="19">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Inference and Serving</h1>
+<p class="lede">Training happens once; inference happens billions of times a day. By 2026, inference is the largest and fastest-growing share of AI compute spend, and cost per token is the number that decides which AI products are viable. This is the chapter most directly tied to money.</p>
+</header>
+
+<h2>The metrics</h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Meaning</th>
+<th>Who cares</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>TTFT</strong> (time to first token)</td>
+<td>Wait before output starts; dominated by prefill and queueing</td>
+<td>Chat UX, voice agents</td>
+</tr>
+<tr>
+<td><strong>TPOT / ITL</strong> (time per output token, inter-token latency)</td>
+<td>Speed of streaming; dominated by decode</td>
+<td>Readability, agent speed</td>
+</tr>
+<tr>
+<td><strong>Throughput</strong></td>
+<td>Total tokens/sec across all users on the hardware</td>
+<td>Cost</td>
+</tr>
+<tr>
+<td><strong>Goodput</strong></td>
+<td>Requests/sec that meet latency SLOs</td>
+<td>The real business metric</td>
+</tr>
+<tr>
+<td><strong>Cost per million tokens</strong></td>
+<td>GPU $/hour ÷ tokens/hour</td>
+<td>Finance</td>
+</tr>
+<tr>
+<td>p50 / p95 / p99 latency</td>
+<td>Tail latency</td>
+<td>SLAs</td>
+</tr>
+</tbody>
+</table>
+<p>End-to-end latency ≈ TTFT + TPOT × (output tokens − 1).</p>
+<h2>Prefill and decode</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph Prefill[&quot;Prefill: process the whole prompt at once&quot;]
+      P1[&quot;All prompt tokens in parallel&quot;] --&gt; P2[&quot;Big matmuls: compute-bound&quot;]
+      P2 --&gt; P3[&quot;Fill KV cache; emit first token&quot;]
+    end
+    subgraph Decode[&quot;Decode: one token per step, per sequence&quot;]
+      D1[&quot;1 new token&quot;] --&gt; D2[&quot;Read ALL weights + KV cache from HBM&quot;]
+      D2 --&gt; D3[&quot;Tiny matmuls: memory-bandwidth-bound&quot;]
+      D3 --&gt; D1
+    end
+    Prefill --&gt; Decode
+</pre>
+</figure>
+<p>The decode-step speed limit for a single sequence is roughly:</p>
+<div class="math">time per token ≥ (bytes of weights read + bytes of KV cache read) ÷ HBM bandwidth
+Llama-3-8B in BF16 on an H100: 16 GB ÷ 3.35 TB/s ≈ 4.8 ms  →  ≤ ~210 tokens/s for one user</div>
+
+<p>Serving 64 users in one batch reads the weights <strong>once per step</strong> for all 64, so throughput rises nearly 64× until compute or KV-cache memory runs out. <strong>Every serving optimisation either increases the batch you can fit, reduces bytes per token, or reduces the number of sequential steps.</strong></p>
+<h2>The KV cache</h2>
+<p>To avoid recomputing attention over the whole history at every step, the server stores each past token's keys and values.</p>
+<div class="math">KV bytes per token = 2 (K and V) × layers × kv_heads × head_dim × bytes per element</div>
+
+<pre><code class="language-python">def kv_per_token(layers, kv_heads, head_dim, bytes_=2):
+    return 2 * layers * kv_heads * head_dim * bytes_
+
+models = {
+    &quot;Llama-2-7B (MHA, 32 kv heads)&quot;: (32, 32, 128),
+    &quot;Llama-3-8B (GQA, 8 kv heads)&quot;:  (32, 8, 128),
+    &quot;Llama-3-70B (GQA, 8 kv heads)&quot;: (80, 8, 128),
+}
+for name, cfg in models.items():
+    b = kv_per_token(*cfg)
+    print(f&quot;{name}: {b/1024:.0f} KB/token, {b*8192/1e9:.2f} GB for one 8K-token sequence&quot;)
+# Llama-2-7B: 512 KB/token -&gt; 4.29 GB per 8K sequence
+# Llama-3-8B: 128 KB/token -&gt; 1.07 GB
+# Llama-3-70B: 320 KB/token -&gt; 2.68 GB
+</code></pre>
+<p>On an 80 GB GPU running Llama-3-8B (16 GB weights), ~60 GB remain for cache: about 56 concurrent 8K-token conversations. <strong>KV cache capacity sets your maximum batch size, which sets your cost.</strong> This is why GQA, MLA, hybrid attention, KV quantization and KV offloading matter so much.</p>
+<h2>Continuous batching</h2>
+<p>Static batching waits for all sequences in a batch to finish, so short answers idle while long ones complete. <strong>Continuous (in-flight) batching</strong> (Orca, 2022) makes scheduling decisions every iteration: finished sequences leave, new ones join immediately.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    Q[&quot;Request queue&quot;] --&gt; S{&quot;Scheduler (every step)&quot;}
+    S --&gt;|&quot;admit if KV memory allows&quot;| B[&quot;Running batch&quot;]
+    B --&gt; F[&quot;One forward pass for all running sequences&quot;]
+    F --&gt; C{&quot;Sequence finished?&quot;}
+    C --&gt;|&quot;yes: free its KV blocks&quot;| S
+    C --&gt;|&quot;no&quot;| B
+    S --&gt;|&quot;memory pressure&quot;| PRE[&quot;Preempt: swap or recompute lowest-priority sequence&quot;]
+</pre>
+</figure>
+<p><strong>Chunked prefill</strong> splits long prompts into chunks mixed into decode batches, so one huge prompt doesn't freeze everyone else's streaming.</p>
+<h2>PagedAttention</h2>
+<p>Before vLLM, servers reserved contiguous KV memory for each request's <em>maximum</em> length, wasting 60–80% of cache memory to fragmentation. <strong>PagedAttention</strong> (vLLM, 2023) stores the cache in fixed-size <strong>blocks</strong> (e.g., 16 tokens) addressed through a per-sequence <strong>block table</strong>, like virtual memory pages in an operating system. Waste drops below 4%, batch sizes rise 2–4×, and blocks can be <strong>shared</strong> between sequences with a common prefix.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph Logical[&quot;Sequence A logical KV&quot;]
+      LA0[&quot;block 0&quot;] --&gt; LA1[&quot;block 1&quot;] --&gt; LA2[&quot;block 2&quot;]
+    end
+    subgraph Table[&quot;Block table A&quot;]
+      T0[&quot;0 → phys 7&quot;]
+      T1[&quot;1 → phys 2&quot;]
+      T2[&quot;2 → phys 9&quot;]
+    end
+    subgraph Physical[&quot;GPU KV memory pool&quot;]
+      P2[&quot;phys 2&quot;]
+      P7[&quot;phys 7&quot;]
+      P9[&quot;phys 9&quot;]
+      P4[&quot;phys 4 (free)&quot;]
+    end
+    LA0 --&gt; T0 --&gt; P7
+    LA1 --&gt; T1 --&gt; P2
+    LA2 --&gt; T2 --&gt; P9
+</pre>
+</figure>
+<h2>Prefix caching</h2>
+<p>Many requests share a prefix: the same system prompt, the same RAG documents, the previous turns of a conversation, or an agent's growing context. <strong>Prefix caching</strong> keeps those KV blocks and reuses them, skipping prefill for the shared part. SGLang's <strong>RadixAttention</strong> stores prefixes in a radix tree. Commercial APIs expose this as <strong>prompt caching</strong> with large discounts on cached input tokens.</p>
+<p>Business impact: for agents and chat, cache hit rates of 50–90% are common, cutting TTFT and cost dramatically. Designing prompts so the stable parts come first ("cache-friendly prompts") is a real optimisation.</p>
+<h2>Quantization</h2>
+<p>Fewer bytes per weight = less to read per decode step and more room for KV cache.</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>What is quantized</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>FP8</strong> (W8A8)</td>
+<td>Weights and activations</td>
+<td>Near-lossless on Hopper/Blackwell; default for large-model serving</td>
+</tr>
+<tr>
+<td><strong>INT8</strong> (SmoothQuant, LLM.int8)</td>
+<td>Weights and activations</td>
+<td>Moves activation outliers into weights</td>
+</tr>
+<tr>
+<td><strong>GPTQ</strong>, <strong>AWQ</strong></td>
+<td>Weights to 4-bit (W4A16)</td>
+<td>Great for small-batch, memory-bound serving</td>
+</tr>
+<tr>
+<td><strong>NVFP4 / MXFP4</strong></td>
+<td>Weights and activations to 4-bit float with block scales</td>
+<td>Blackwell/Rubin native; gpt-oss shipped in MXFP4</td>
+</tr>
+<tr>
+<td><strong>GGUF</strong> (llama.cpp)</td>
+<td>2–8-bit weights, many schemes</td>
+<td>Laptops and CPUs</td>
+</tr>
+<tr>
+<td><strong>KV cache FP8 / INT4</strong></td>
+<td>The cache</td>
+<td>Doubles or quadruples context capacity</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-python"># AWQ 4-bit quantization with llm-compressor (vLLM project), then serve
+from llmcompressor import oneshot
+from llmcompressor.modifiers.awq import AWQModifier
+oneshot(model=&quot;meta-llama/Llama-3.1-8B-Instruct&quot;,
+        dataset=&quot;open_platypus&quot;, num_calibration_samples=256,
+        recipe=[AWQModifier(targets=[&quot;Linear&quot;], scheme=&quot;W4A16&quot;, ignore=[&quot;lm_head&quot;])],
+        output_dir=&quot;Llama-3.1-8B-Instruct-AWQ&quot;)
+# vllm serve ./Llama-3.1-8B-Instruct-AWQ
+</code></pre>
+<p>Always evaluate quality after quantizing, on <em>your</em> tasks. Averages hide regressions on math, code and long context.</p>
+<h2>Speculative decoding</h2>
+<p>Decode is sequential and memory-bound, so the GPU has spare compute. <strong>Speculative decoding</strong> uses a cheap <strong>draft</strong> to guess several tokens ahead; the big model <strong>verifies all guesses in one forward pass</strong> and keeps the longest correct prefix. Output distribution is mathematically unchanged.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Draft proposes 4 tokens: &#x27;the cat sat on&#x27;&quot;] --&gt; B[&quot;Target model scores all 4 in ONE pass&quot;]
+    B --&gt; C{&quot;Accept tokens while they match the target&#x27;s distribution&quot;}
+    C --&gt;|&quot;3 accepted + 1 corrected&quot;| D[&quot;4 tokens for ~1 target step&quot;]
+    D --&gt; A
+</pre>
+</figure>
+<p>Draft options: a small model from the same family; <strong>Medusa</strong> heads; <strong>EAGLE-3</strong> (a light draft head on the target's hidden states, one of the best-performing methods); DeepSeek's <strong>MTP</strong> heads; n-gram / prompt-lookup (great when output copies input, like code edits). Typical speedups: 2–3× at low batch sizes; gains shrink at high batch sizes where compute is no longer idle.</p>
+<h2>Parallelism for inference</h2>
+<ul>
+<li><strong>Tensor parallelism</strong> splits each layer across GPUs in a node: lowers latency, needed when weights exceed one GPU.</li>
+<li><strong>Pipeline parallelism</strong> across nodes for very large models.</li>
+<li><strong>Expert parallelism</strong> for MoE: DeepSeek's production deployment used large-scale EP across many nodes with separate prefill and decode clusters.</li>
+<li><strong>Data parallelism</strong> (replicas) for throughput, behind a load balancer.</li>
+</ul>
+<h2>Disaggregated serving</h2>
+<p>Prefill is compute-bound; decode is memory-bound. On the same GPU they interfere: a big prefill stalls everyone's decode. <strong>Disaggregation</strong> (DistServe, Splitwise, Mooncake, 2024) runs them on separate GPU pools and transfers the KV cache between them over fast interconnects.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    U[&quot;Request&quot;] --&gt; R[&quot;Router (KV-cache-aware)&quot;]
+    R --&gt; PF[&quot;Prefill pool (compute-optimised GPUs)&quot;]
+    PF --&gt;|&quot;KV cache via NVLink / RDMA (NIXL)&quot;| DC[&quot;Decode pool (bandwidth-optimised GPUs)&quot;]
+    DC --&gt; S[&quot;Stream tokens to user&quot;]
+    KV[&quot;Distributed KV cache store (GPU, CPU RAM, SSD)&quot;] &lt;--&gt; PF
+    KV &lt;--&gt; DC
+</pre>
+</figure>
+<p>This is now mainstream at scale: NVIDIA <strong>Dynamo</strong>, <strong>llm-d</strong> (Red Hat, Google, IBM and others on Kubernetes), SGLang and vLLM all support it, and NVIDIA's Rubin CPX chip exists specifically for the prefill side. Moonshot's <strong>Mooncake</strong> built Kimi's serving around a KV-cache-centric design.</p>
+<h2>The serving engines</h2>
+<table>
+<thead>
+<tr>
+<th>Engine</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>vLLM</strong></td>
+<td>The most widely used open-source engine; PagedAttention; huge model coverage; OpenAI-compatible server</td>
+</tr>
+<tr>
+<td><strong>SGLang</strong></td>
+<td>RadixAttention, fast structured output, strong DeepSeek/MoE performance, used at large scale by xAI and others</td>
+</tr>
+<tr>
+<td><strong>TensorRT-LLM</strong></td>
+<td>NVIDIA's highly optimised engine; best peak performance on NVIDIA hardware</td>
+</tr>
+<tr>
+<td><strong>NVIDIA Dynamo</strong></td>
+<td>Orchestration layer for disaggregated, multi-node serving over vLLM/SGLang/TRT-LLM</td>
+</tr>
+<tr>
+<td><strong>llama.cpp / Ollama / LM Studio</strong></td>
+<td>Local and CPU/Mac inference, GGUF quantization</td>
+</tr>
+<tr>
+<td><strong>MLC-LLM, ExecuTorch</strong></td>
+<td>On-device (phones, browsers)</td>
+</tr>
+<tr>
+<td><strong>Hugging Face TGI</strong></td>
+<td>Earlier production server, now in maintenance mode</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-bash"># Serve an open model with vLLM (OpenAI-compatible API on port 8000)
+pip install vllm
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --max-model-len 16384 --gpu-memory-utilization 0.90 \
+  --enable-prefix-caching --max-num-seqs 256
+</code></pre>
+<pre><code class="language-python">from openai import OpenAI
+client = OpenAI(base_url=&quot;http://localhost:8000/v1&quot;, api_key=&quot;none&quot;)
+r = client.chat.completions.create(model=&quot;Qwen/Qwen2.5-7B-Instruct&quot;,
+        messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Explain KV caching in two sentences.&quot;}])
+print(r.choices[0].message.content)
+</code></pre>
+<h2>Benchmarking properly</h2>
+<pre><code class="language-python"># load_test.py: concurrent streaming requests, measuring TTFT, TPOT, throughput
+import asyncio, time, statistics
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI(base_url=&quot;http://localhost:8000/v1&quot;, api_key=&quot;none&quot;)
+MODEL = &quot;Qwen/Qwen2.5-7B-Instruct&quot;
+
+async def one(prompt):
+    t0 = time.perf_counter(); first = None; n = 0
+    stream = await client.chat.completions.create(model=MODEL, stream=True, max_tokens=256,
+                                                  messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: prompt}])
+    async for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            first = first or time.perf_counter(); n += 1
+    end = time.perf_counter()
+    return first - t0, (end - first) / max(n - 1, 1), n
+
+async def main(concurrency=64, total=512):
+    sem = asyncio.Semaphore(concurrency)
+    async def run(i):
+        async with sem:
+            return await one(f&quot;Write a short story about server #{i}.&quot;)
+    t0 = time.perf_counter()
+    res = await asyncio.gather(*(run(i) for i in range(total)))
+    wall = time.perf_counter() - t0
+    ttft = sorted(r[0] for r in res); tpot = sorted(r[1] for r in res)
+    print(f&quot;TTFT p50 {statistics.median(ttft)*1e3:.0f} ms  p95 {ttft[int(.95*len(ttft))]*1e3:.0f} ms&quot;)
+    print(f&quot;TPOT p50 {statistics.median(tpot)*1e3:.1f} ms&quot;)
+    print(f&quot;throughput {sum(r[2] for r in res)/wall:.0f} output tok/s&quot;)
+
+asyncio.run(main())
+</code></pre>
+<p>Also use <code>vllm bench serve</code>, NVIDIA <strong>GenAI-Perf / AIPerf</strong>, and the public <strong>InferenceMAX</strong> benchmark results. Always test with <strong>realistic input/output length distributions</strong>; a benchmark of 128-token prompts says nothing about a RAG workload with 8,000-token prompts.</p>
+<h2>Cost per million tokens</h2>
+<pre><code class="language-python">def cost_per_million(gpu_hourly_usd, n_gpus, tokens_per_sec):
+    return gpu_hourly_usd * n_gpus / (tokens_per_sec * 3600) * 1e6
+
+print(cost_per_million(2.50, 1, 2500))    # one H100 at $2.50/h, 2,500 tok/s -&gt; $0.28 / M tokens
+print(cost_per_million(2.50, 1, 150))     # same GPU, unbatched, 150 tok/s  -&gt; $4.63 / M tokens
+</code></pre>
+<p>Same hardware, 16× difference in cost, purely from batching and utilisation. This is the heart of inference engineering.</p>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project 1 (flagship): "Our LLM bill is too high"</h3>
+<p><strong>Business problem:</strong> a company runs an open 8B model with naive Hugging Face <code>generate()</code> on dedicated GPUs and pays too much per token.</p>
+<ol>
+<li>Baseline: Hugging Face Transformers, batch size 1. Measure TTFT, TPOT, throughput, $/M tokens.</li>
+<li>vLLM with continuous batching and PagedAttention at concurrency 1, 16, 64, 256.</li>
+<li>Add FP8 or AWQ 4-bit quantization; measure quality on a 200-question eval.</li>
+<li>Enable prefix caching with a realistic 2,000-token shared system prompt.</li>
+<li>Add speculative decoding (EAGLE-3 or n-gram) and measure at low vs. high concurrency.</li>
+<li>Deliverable: a latency-vs-throughput curve for each configuration and a one-page recommendation: "Config X serves our traffic at $Y/M tokens with p95 TTFT under 500 ms, a Z× saving."</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Kwon et al., <em>Efficient Memory Management for LLM Serving with PagedAttention</em> (2023).</li>
+<li>Yu et al., <em>Orca</em> (2022); Zhong et al., <em>DistServe</em> (2024); Qin et al., <em>Mooncake</em> (2024).</li>
+<li>Leviathan et al., <em>Fast Inference from Transformers via Speculative Decoding</em> (2023); Li et al., <em>EAGLE-3</em> (2025).</li>
+<li>vLLM and SGLang documentation and blogs; NVIDIA Dynamo docs.</li>
+<li>Baseten / Anyscale / Databricks engineering blogs on LLM inference performance.</li>
+<li>Stanford CS336 inference lecture; Google DeepMind <em>How to Scale Your Model</em>, inference chapter.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

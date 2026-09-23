@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pretraining and Scaling Laws · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="10">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Pretraining and Scaling Laws</h1>
+<p class="lede">Pretraining is where a model learns almost everything it knows: grammar, facts, reasoning patterns, code. It is also where most of the money goes. This chapter covers the data pipeline, the scaling laws that decide how big a model to train, and what a frontier-scale training run actually looks like.</p>
+</header>
+
+<h2>The objective</h2>
+<p>Pretraining is next-token prediction on a huge corpus, minimising cross-entropy. Nothing more. Capabilities like translation, summarisation and coding emerge because predicting text well <em>requires</em> them.</p>
+<h2>The data pipeline</h2>
+<p>Data quality is the most closely guarded secret at every lab. A typical pipeline:</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    A[&quot;Raw sources: Common Crawl, code (GitHub), books, papers, math, multilingual web, licensed data, synthetic data&quot;] --&gt; B[&quot;Text extraction (HTML to text, PDF parsing, OCR)&quot;]
+    B --&gt; C[&quot;Language identification&quot;]
+    C --&gt; D[&quot;Heuristic filters: length, symbol ratio, repetition, bad words&quot;]
+    D --&gt; E[&quot;Deduplication: exact hashes + MinHash / LSH near-duplicates&quot;]
+    E --&gt; F[&quot;Model-based quality scoring (classifier trained to spot &#x27;educational&#x27; text)&quot;]
+    F --&gt; G[&quot;PII scrubbing, toxicity and safety filters, decontamination against benchmarks&quot;]
+    G --&gt; H[&quot;Domain mixing: choose % of web / code / math / books&quot;]
+    H --&gt; I[&quot;Tokenize and pack into fixed-length sequences&quot;]
+    I --&gt; J[&quot;Shuffle, shard, stream to GPUs&quot;]
+</pre>
+</figure>
+<p>Key facts:</p>
+<ul>
+<li><strong>Scale:</strong> Llama 3 trained on about 15 trillion tokens (2024); DeepSeek-V3 on 14.8T; Qwen3 on about 36T (2025). Frontier 2026 runs are believed to use tens of trillions of tokens, a rising share of which is synthetic.</li>
+<li><strong>Quality beats quantity:</strong> Hugging Face's <strong>FineWeb-Edu</strong> showed that keeping only web pages a classifier rates as "educational" improves models dramatically per token.</li>
+<li><strong>Deduplication</strong> matters because repeated text wastes compute and encourages memorisation.</li>
+<li><strong>Decontamination</strong> removes benchmark questions from training data so evaluations stay honest.</li>
+<li><strong>Data mixture</strong> is tuned with small proxy models, then the best mixture is used at full scale. Code and math data improve reasoning even for non-code tasks.</li>
+<li><strong>Annealing / mid-training:</strong> at the end of pretraining, the learning rate decays while the mix shifts toward the highest-quality data (curated math, code, reasoning traces, long documents).</li>
+</ul>
+<h3>Infrastructure of data</h3>
+<p>Data processing for a frontier run is a big-data job in its own right: petabytes of raw crawl processed with Spark, Ray Data, Dask or custom Rust tooling on thousands of CPU cores; stored as sharded Parquet or custom binary formats on object storage; and streamed to GPUs fast enough to never stall them. Hugging Face's <code>datatrove</code> and NVIDIA's NeMo Curator are open-source examples.</p>
+<pre><code class="language-python"># Packing documents into fixed-length training sequences
+import numpy as np
+def pack(token_docs, seq_len, eos_id):
+    buf = []
+    for doc in token_docs:
+        buf.extend(doc + [eos_id])
+        while len(buf) &gt;= seq_len + 1:
+            chunk, buf = buf[:seq_len + 1], buf[seq_len:]
+            yield np.array(chunk[:-1]), np.array(chunk[1:])   # inputs, targets
+</code></pre>
+<h2>Scaling laws</h2>
+<p>In 2020, Kaplan et al. at OpenAI found that loss falls as a <strong>power law</strong> in parameters N, data D, and compute C, smoothly across many orders of magnitude. In 2022, Hoffmann et al. at DeepMind (<strong>Chinchilla</strong>) refitted the laws and found the compute-optimal recipe:</p>
+<div class="math">L(N, D) = E + A / N^α + B / D^β          (α ≈ 0.34, β ≈ 0.28 in the Chinchilla fit)
+Compute C ≈ 6 · N · D
+Compute-optimal: D ≈ 20 · N tokens</div>
+
+<p>Meaning: with a fixed budget, grow parameters and data together. Chinchilla (70B params, 1.4T tokens) beat Gopher (280B params, 300B tokens) using the same compute.</p>
+<pre><code class="language-python">def chinchilla_optimal(C):
+    # C = 6 N D and D = 20 N  -&gt;  C = 120 N^2
+    N = (C / 120) ** 0.5
+    return N, 20 * N
+
+for C in [1e21, 1e23, 1e25, 1e26]:
+    N, D = chinchilla_optimal(C)
+    print(f&quot;C={C:.0e}: N={N/1e9:7.1f}B params, D={D/1e12:6.2f}T tokens&quot;)
+</code></pre>
+<h3>"Overtraining" for inference economics</h3>
+<p>Chinchilla-optimal minimises <em>training</em> cost. But a model that will serve billions of requests should be <strong>smaller and trained longer</strong>, because inference cost scales with parameters. Llama 3 8B was trained on 15T tokens, about 1,875 tokens per parameter, almost 100× past Chinchilla-optimal. This is the norm now: small models are "overtrained" deliberately.</p>
+<div class="callout"><p><strong>Key idea.</strong> Total cost = training cost + (inference cost per token × tokens served over the model's life). For popular models, inference dominates, so labs trade extra training compute for a smaller, cheaper-to-serve model.</p></div>
+<h3>Emergent abilities and predictability</h3>
+<p>Some abilities appear to switch on suddenly at scale ("emergence"), though later work showed that with smoother metrics, many improve gradually. Labs now predict the final loss of big runs from small runs with high accuracy. Predicting specific downstream <em>capabilities</em> remains harder, which is a core problem for safety evaluations.</p>
+<h3>The three scaling axes (2024–2026)</h3>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Pretraining scaling: more params and data&quot;] --&gt; D[&quot;Capability&quot;]
+    B[&quot;Post-training / RL scaling: more RL compute on verifiable tasks&quot;] --&gt; D
+    C[&quot;Test-time scaling: more thinking tokens per question&quot;] --&gt; D
+</pre>
+</figure>
+<p>By 2025, the industry spoke of three scaling laws. Pretraining gains continued but became more expensive per step of improvement; <strong>RL scaling</strong> and <strong>test-time compute</strong> (Chapters 12–13) delivered the biggest jumps in reasoning and agentic ability. In 2026, the labs' biggest compute budgets are split between very large pretraining runs and very large RL runs.</p>
+<h2>Anatomy of a frontier training run</h2>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Order of magnitude (2025–2026 frontier)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Training compute</td>
+<td>10²⁵–10²⁷ FLOPs</td>
+</tr>
+<tr>
+<td>GPUs</td>
+<td>20,000–200,000+ accelerators (H100/H200, B200/GB200/GB300, TPU, Trainium)</td>
+</tr>
+<tr>
+<td>Duration</td>
+<td>1–4 months of pretraining, plus months of post-training</td>
+</tr>
+<tr>
+<td>Power</td>
+<td>50–500+ MW for the cluster</td>
+</tr>
+<tr>
+<td>Cost of compute</td>
+<td>Hundreds of millions to billions of dollars</td>
+</tr>
+<tr>
+<td>Team</td>
+<td>Hundreds of researchers and engineers</td>
+</tr>
+</tbody>
+</table>
+<p>A detail that surprises newcomers: <strong>reliability</strong> is a first-class problem. At 100,000 GPUs, hardware fails constantly. Meta reported 419 unexpected interruptions during a 54-day Llama 3 405B run on 16,384 H100s, roughly one every three hours, mostly GPU and HBM failures. The infrastructure must detect failures, drain bad nodes, restore from checkpoints and resume in minutes. <strong>Goodput</strong> (the fraction of time spent making real progress) is a headline metric.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;Training steps&quot;] --&gt; B{&quot;Node failure or loss spike?&quot;}
+    B --&gt;|&quot;no&quot;| C[&quot;Async checkpoint every N steps&quot;]
+    C --&gt; A
+    B --&gt;|&quot;yes&quot;| D[&quot;Detect: health checks, NCCL timeouts&quot;]
+    D --&gt; E[&quot;Evict bad node, pull a hot spare&quot;]
+    E --&gt; F[&quot;Reload last checkpoint (in-memory or fast storage)&quot;]
+    F --&gt; A
+</pre>
+</figure>
+<h2>Metrics to watch during a run</h2>
+<ul>
+<li><strong>Training and validation loss</strong> (smooth downward curve; spikes are warnings).</li>
+<li><strong>Gradient norm</strong> (sudden growth predicts spikes).</li>
+<li><strong>Tokens per second</strong> and <strong>MFU</strong>: model FLOPs utilisation, the fraction of peak hardware FLOPs doing useful model math. 35–50% is good for large dense models; MoE runs are often lower.</li>
+<li><strong>Downstream evals</strong> on intermediate checkpoints (MMLU-style knowledge, GSM8K-style math, HumanEval-style code).</li>
+<li><strong>Goodput</strong> and time lost to failures.</li>
+</ul>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project: Train a small GPT and measure MFU</h3>
+<p><strong>Business problem:</strong> a team wants to know whether a custom small model for their domain is affordable.</p>
+<ol>
+<li>Train a ~125M-parameter GPT on 2–10B tokens of FineWeb-Edu using Karpathy's <strong>nanoGPT</strong> or <strong>nanochat</strong>, or the <code>modded-nanogpt</code> speedrun repository, on a rented 8×H100 node.</li>
+<li>Log tokens/sec and compute MFU = (6 · N · tokens/sec) / (GPUs × peak FLOP/s).</li>
+<li>Try <code>torch.compile</code>, BF16 vs FP32, and FlashAttention on/off. Record each change's effect.</li>
+<li>Deliverable: a table of "cost to train to loss X" and a projection of what a 1B model on 50B tokens would cost.</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Kaplan et al., <em>Scaling Laws for Neural Language Models</em> (2020); Hoffmann et al., <em>Training Compute-Optimal Large Language Models</em> (2022).</li>
+<li>Meta, <em>The Llama 3 Herd of Models</em> (2024): the most detailed public account of a frontier-scale run.</li>
+<li>DeepSeek-AI, <em>DeepSeek-V3 Technical Report</em> (2024).</li>
+<li>Penedo et al., <em>The FineWeb Datasets</em> (2024).</li>
+<li>Hugging Face, <em>The Smol Training Playbook</em> (2025).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Story of AI, 1943–2026 · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="1">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>The Story of AI, 1943–2026</h1>
+<p class="lede">Every idea in this book has an origin, and most of them are older than you think. Knowing the history tells you which ideas keep coming back, and why the industry looks the way it does today.</p>
+</header>
+
+<h2>Why history matters for an engineer</h2>
+<p>AI has gone through at least three boom-and-bust cycles. Each boom was driven by a real technical advance; each bust came when that advance hit a wall of <strong>compute, data, or theory</strong>. The present boom is different mainly because all three walls fell at once: GPUs gave cheap parallel compute, the internet gave near-unlimited text and images, and the Transformer gave an architecture that keeps improving as you feed it more of both.</p>
+<p>If you remember one sentence from this chapter, make it Rich Sutton's "Bitter Lesson" (2019): <em>general methods that leverage computation are ultimately the most effective, and by a large margin.</em> Almost every infrastructure decision in 2026 follows from that sentence. Companies are building gigawatt data centers because, so far, more compute has reliably bought more capability.</p>
+<h2>The timeline</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    A[&quot;1943 McCulloch-Pitts neuron&quot;] --&gt; B[&quot;1956 Dartmouth workshop: &#x27;AI&#x27; is named&quot;]
+    B --&gt; C[&quot;1958 Rosenblatt&#x27;s Perceptron&quot;]
+    C --&gt; D[&quot;1969 Minsky and Papert: perceptrons can&#x27;t do XOR&quot;]
+    D --&gt; E[&quot;1970s First AI winter&quot;]
+    E --&gt; F[&quot;1980s Expert systems boom&quot;]
+    F --&gt; G[&quot;1986 Backpropagation popularised&quot;]
+    G --&gt; H[&quot;Late 1980s Second AI winter&quot;]
+    H --&gt; I[&quot;1998 LeNet-5 reads cheques&quot;]
+    I --&gt; J[&quot;2006 Deep belief nets, &#x27;deep learning&#x27; rebrand&quot;]
+    J --&gt; K[&quot;2012 AlexNet wins ImageNet on 2 GPUs&quot;]
+    K --&gt; L[&quot;2014 GANs, seq2seq, attention&quot;]
+    L --&gt; M[&quot;2016 AlphaGo&quot;]
+    M --&gt; N[&quot;2017 &#x27;Attention Is All You Need&#x27;&quot;]
+    N --&gt; O[&quot;2018-2020 BERT, GPT-2, GPT-3, scaling laws&quot;]
+    O --&gt; P[&quot;2022 ChatGPT, diffusion image models&quot;]
+    P --&gt; Q[&quot;2023-2024 GPT-4, Claude 3, Llama, MoE, open weights&quot;]
+    Q --&gt; R[&quot;2024-2025 Reasoning models: o1, DeepSeek-R1&quot;]
+    R --&gt; S[&quot;2025-2026 Agents, gigawatt clusters, monthly frontier releases&quot;]
+</pre>
+</figure>
+<h2>Era 1: Symbols and the first neuron (1943–1969)</h2>
+<p><strong>1943.</strong> Warren McCulloch and Walter Pitts described an artificial neuron: it sums weighted inputs and "fires" if the sum passes a threshold. That is still, in essence, what one unit in a neural network does.</p>
+<p><strong>1950.</strong> Alan Turing's paper <em>Computing Machinery and Intelligence</em> proposed the imitation game (the Turing test) and, less famously, suggested that a machine could be <em>taught</em> like a child rather than programmed.</p>
+<p><strong>1956.</strong> The Dartmouth Summer Research Project coined the term "artificial intelligence." The founders (McCarthy, Minsky, Shannon, Rochester) believed a summer might be enough to make major progress. It was not.</p>
+<p><strong>1958.</strong> Frank Rosenblatt built the <strong>Perceptron</strong>, a machine that <em>learned</em> its weights from examples. The New York Times reported the Navy expected it to "walk, talk, see, write, reproduce itself and be conscious."</p>
+<p><strong>1969.</strong> Minsky and Papert's book <em>Perceptrons</em> proved that a single-layer perceptron cannot learn XOR (a function that outputs 1 when exactly one input is 1). Multi-layer networks could, but nobody knew how to train them. Funding for neural networks collapsed.</p>
+<h2>Era 2: Expert systems and the winters (1970–1990s)</h2>
+<p>Meanwhile, <strong>symbolic AI</strong> tried to encode human knowledge as rules: <code>IF fever AND rash THEN measles</code>. Expert systems such as MYCIN (medical diagnosis) and XCON (configuring computers at DEC) made real money in the 1980s. They failed because rules are brittle, expensive to write, and cannot cover the messiness of the real world. When the market for specialised Lisp machines collapsed around 1987, the second AI winter began.</p>
+<p>The lesson the field eventually drew: <strong>hand-written knowledge does not scale; learned knowledge does.</strong></p>
+<h2>Era 3: Learning from data (1986–2011)</h2>
+<p><strong>1986.</strong> Rumelhart, Hinton and Williams popularised <strong>backpropagation</strong>, an efficient way to compute how every weight in a multi-layer network should change to reduce error. You will implement it in Chapter 4.</p>
+<p><strong>1989–1998.</strong> Yann LeCun applied backprop to <strong>convolutional networks</strong>. LeNet-5 read handwritten digits on bank cheques in production in the US.</p>
+<p><strong>1997.</strong> Hochreiter and Schmidhuber introduced the <strong>LSTM</strong>, a recurrent network that could remember information over long sequences. It powered speech recognition and translation for the next 20 years.</p>
+<p><strong>1990s–2000s.</strong> Neural nets were out of fashion. <strong>Support vector machines</strong>, <strong>random forests</strong>, and <strong>gradient boosting</strong> ruled because they worked well on small data with modest compute. Statistical machine learning became the dominant paradigm. These methods still run a large share of production ML (fraud, ranking, credit scoring) today.</p>
+<p><strong>2006–2009.</strong> Geoffrey Hinton's group showed deep networks could be trained layer by layer; the term "deep learning" took hold. In 2009, Fei-Fei Li's team released <strong>ImageNet</strong>: 14 million labelled images. Data was about to stop being the bottleneck.</p>
+<h2>Era 4: The deep learning revolution (2012–2017)</h2>
+<p><strong>2012: AlexNet.</strong> Alex Krizhevsky, Ilya Sutskever and Geoffrey Hinton trained an 8-layer CNN on <strong>two NVIDIA GTX 580 gaming GPUs</strong> and cut the ImageNet error rate from about 26% to about 15%. This is the moment compute, data and algorithms clicked together. It is also the moment NVIDIA's destiny changed: CUDA, launched in 2007 for scientific computing, became the platform of AI.</p>
+<p><strong>2013.</strong> word2vec showed that words could be represented as vectors where <code>king − man + woman ≈ queen</code>.</p>
+<p><strong>2014.</strong> Three big ideas: <strong>GANs</strong> (Goodfellow) for generating images; <strong>sequence-to-sequence</strong> models (Sutskever) for translation; and <strong>attention</strong> (Bahdanau), which let a decoder look back at any part of the input.</p>
+<p><strong>2015.</strong> <strong>ResNet</strong> (He et al.) used skip connections to train 152-layer networks. Residual connections are in every Transformer today. <strong>Adam</strong> optimiser and <strong>batch normalization</strong> also arrived around here.</p>
+<p><strong>2016.</strong> DeepMind's <strong>AlphaGo</strong> beat Lee Sedol at Go using deep networks plus reinforcement learning plus tree search. That recipe (learned model + search + RL) reappears in 2024's reasoning models.</p>
+<h2>Era 5: Transformers and scale (2017–2022)</h2>
+<p><strong>2017.</strong> Google's <em>Attention Is All You Need</em> introduced the <strong>Transformer</strong>: no recurrence, just attention and feed-forward layers, and fully parallel across the sequence. Parallelism means it maps perfectly onto GPUs. Everything since is built on it.</p>
+<p><strong>2018.</strong> <strong>BERT</strong> (Google, encoder-only) dominated language understanding. <strong>GPT-1</strong> (OpenAI, decoder-only) showed that pretraining on raw text then fine-tuning works.</p>
+<p><strong>2019.</strong> <strong>GPT-2</strong> (1.5B parameters) wrote coherent paragraphs. OpenAI staged its release over misuse fears, the first public argument about release policy.</p>
+<p><strong>2020.</strong> <strong>GPT-3</strong> (175B) showed <em>in-context learning</em>: give it a few examples in the prompt and it performs a new task without any weight updates. Kaplan et al. published <strong>scaling laws</strong>: loss falls as a smooth power law in parameters, data and compute. Scaling became an engineering plan rather than a hope.</p>
+<p><strong>2021.</strong> <strong>CLIP</strong> linked images and text in one embedding space; <strong>DALL·E</strong> generated images from text; <strong>Codex</strong> wrote code (and became GitHub Copilot). Anthropic was founded.</p>
+<p><strong>2022.</strong> DeepMind's <strong>Chinchilla</strong> paper corrected the scaling laws: most models were undertrained, and you should scale data as fast as parameters. <strong>Stable Diffusion</strong> released open image-generation weights. <strong>InstructGPT</strong> showed RLHF makes models follow instructions. On <strong>30 November 2022, ChatGPT</strong> launched and reached 100 million users in about two months, then the fastest-growing consumer app in history.</p>
+<h2>Era 6: The platform race (2023–2026)</h2>
+<p><strong>2023.</strong> GPT-4 (multimodal, much stronger reasoning), Claude, Llama (Meta's open weights, which triggered the open-model ecosystem), Mistral, and Mixtral (open mixture-of-experts). vLLM's PagedAttention made serving far cheaper. H100 GPUs became the most sought-after chips in the world.</p>
+<p><strong>2024.</strong> Long context (1M+ tokens), native multimodality (GPT-4o, Gemini 1.5), and Claude 3.5 Sonnet raised the bar for coding. In September, OpenAI's <strong>o1</strong> introduced <em>reasoning models</em> that "think" with long chains of thought trained by reinforcement learning. In December, <strong>DeepSeek-V3</strong> (671B MoE, trained for a reported ~$5.6M of GPU time) showed frontier-class results were possible far more cheaply than assumed.</p>
+<p><strong>2025.</strong> <strong>DeepSeek-R1</strong> (January) published an open recipe for reasoning via RL and briefly knocked about $600B off NVIDIA's market value in one day. Agents became a product category: coding agents (Claude Code, Codex, Cursor), computer use, deep research. The <strong>Model Context Protocol (MCP)</strong> became a common standard for connecting models to tools. NVIDIA shipped Blackwell (GB200/GB300 NVL72 racks). Hyperscaler AI capex passed hundreds of billions of dollars per year.</p>
+<p><strong>2026 (to September).</strong> Release cadence at the frontier became roughly monthly. Mythos-tier and GPT-6-class models arrived; open-weight Chinese labs (DeepSeek V4, Qwen 3.x, Kimi K3, GLM-5.x) came within a few points of closed models on coding benchmarks; NVIDIA's Vera Rubin platform entered production for H2 2026 shipments; and AI-driven cybersecurity capability became a central policy concern. Chapter 28 covers this in detail.</p>
+<h2>Three recurring patterns</h2>
+<table>
+<thead>
+<tr>
+<th>Pattern</th>
+<th>Examples</th>
+<th>What it means for you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Scale beats cleverness (eventually)</strong></td>
+<td>AlexNet, GPT-3, Chinchilla</td>
+<td>Infrastructure that makes scale cheaper is the highest-leverage work in AI.</td>
+</tr>
+<tr>
+<td><strong>Old ideas return when compute catches up</strong></td>
+<td>Neural nets (1958→2012), RL + search (AlphaGo→o1), MoE (1991→2023)</td>
+<td>Read old papers; many are waiting for hardware.</td>
+</tr>
+<tr>
+<td><strong>Efficiency shocks reshape markets</strong></td>
+<td>DeepSeek-V3/R1, quantization, distillation</td>
+<td>Cost per token falls roughly 10× per year for a fixed capability level. Plan products around that.</td>
+</tr>
+</tbody>
+</table>
+<div class="callout"><p><strong>Key idea.</strong> AI progress = algorithms × data × compute. For the last decade, compute has grown fastest (frontier training compute has grown roughly 4–5× per year). Infrastructure engineers are the people who turn money and electricity into that compute efficiently.</p></div>
+<h2>Further reading</h2>
+<ul>
+<li>Rich Sutton, <em>The Bitter Lesson</em> (2019), a one-page essay.</li>
+<li>Krizhevsky, Sutskever, Hinton, <em>ImageNet Classification with Deep Convolutional Neural Networks</em> (2012).</li>
+<li>Vaswani et al., <em>Attention Is All You Need</em> (2017).</li>
+<li>Epoch AI's data pages on training compute trends (epoch.ai).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

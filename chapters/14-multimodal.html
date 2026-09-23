@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Multimodal and Generative Media · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="14">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Multimodal and Generative Media</h1>
+<p class="lede">Frontier models see images, read documents, listen, speak, and in many products generate images, video and music. This chapter explains the two big families (vision-language models and diffusion models) and how they are built and served.</p>
+</header>
+
+<h2>Contrastive learning: CLIP</h2>
+<p>OpenAI's <strong>CLIP</strong> (2021) trained an image encoder and a text encoder together on 400 million image–caption pairs. The objective: matching pairs should have high dot product; mismatched pairs low. The result is a <strong>shared embedding space</strong> for images and text, enabling zero-shot classification ("a photo of a dog" vs. "a photo of a cat") and image search.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    I[&quot;Batch of N images&quot;] --&gt; IE[&quot;Image encoder (ViT)&quot;] --&gt; IV[&quot;N image vectors&quot;]
+    T[&quot;Batch of N captions&quot;] --&gt; TE[&quot;Text encoder (Transformer)&quot;] --&gt; TV[&quot;N text vectors&quot;]
+    IV --&gt; S[&quot;N x N similarity matrix&quot;]
+    TV --&gt; S
+    S --&gt; L[&quot;Loss: diagonal (true pairs) high, off-diagonal low&quot;]
+</pre>
+</figure>
+<pre><code class="language-python">import torch, torch.nn.functional as F
+def clip_loss(img_emb, txt_emb, temperature=0.07):
+    img = F.normalize(img_emb, dim=-1); txt = F.normalize(txt_emb, dim=-1)
+    logits = img @ txt.T / temperature                   # (N, N)
+    labels = torch.arange(len(img))
+    return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+</code></pre>
+<p>Successors: SigLIP / SigLIP 2 (Google, sigmoid loss), used as the vision tower in many open VLMs.</p>
+<h2>Vision-language models (VLMs)</h2>
+<p>The dominant recipe (LLaVA, Qwen-VL, InternVL, Llama 4, Gemma 3):</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    IMG[&quot;Image&quot;] --&gt; VE[&quot;Vision encoder (ViT / SigLIP)&quot;]
+    VE --&gt; PR[&quot;Projector (MLP): image features to LLM token space&quot;]
+    PR --&gt; TOK[&quot;Image &#x27;tokens&#x27; (hundreds to thousands per image)&quot;]
+    TXT[&quot;Text prompt&quot;] --&gt; TT[&quot;Text tokens&quot;]
+    TOK --&gt; LLM[&quot;LLM decoder&quot;]
+    TT --&gt; LLM
+    LLM --&gt; OUT[&quot;Text answer&quot;]
+</pre>
+</figure>
+<p>Training usually goes: (1) train only the projector on image-caption pairs; (2) unfreeze and train on instruction data (charts, documents, screenshots, OCR, reasoning over images). <strong>Natively multimodal</strong> models (Gemini, GPT-4o onward, Llama 4, Kimi K3) mix modalities during pretraining itself.</p>
+<p><strong>Infrastructure note:</strong> images are expensive. A high-resolution screenshot can become 1,000–3,000 tokens. Document-processing pipelines at scale (invoices, contracts, medical records) are large inference workloads, and image-token cost is a common optimisation target (tiling strategies, resolution limits, caching).</p>
+<h2>Speech and audio</h2>
+<ul>
+<li><strong>ASR</strong> (speech-to-text): Whisper and successors; streaming models for real-time captions.</li>
+<li><strong>TTS</strong> (text-to-speech): neural codecs plus Transformers (ElevenLabs, OpenAI, Cartesia, open models like Kokoro, Sesame, Orpheus).</li>
+<li><strong>Speech-to-speech</strong> models (GPT-4o-style realtime voice, Gemini Live, Moshi) process audio tokens directly for sub-second, interruptible conversation.</li>
+</ul>
+<p>Latency is everything in voice: humans expect a response within about 300–500 ms. Voice-agent infrastructure (WebRTC transport, streaming ASR, fast first token, streaming TTS) is a distinct engineering specialty.</p>
+<h2>Diffusion models: generating images and video</h2>
+<p>A diffusion model learns to <strong>reverse a noising process</strong>. During training, take a clean image, add a random amount of Gaussian noise, and train a network to predict the noise. At generation time, start from pure noise and remove it step by step.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph Training
+      X0[&quot;Clean image x0&quot;] --&gt; N[&quot;Add noise at random level t&quot;] --&gt; XT[&quot;Noisy xt&quot;]
+      XT --&gt; NET[&quot;Network predicts the noise (conditioned on t and text)&quot;]
+      NET --&gt; L[&quot;Loss: predicted noise vs true noise (MSE)&quot;]
+    end
+    subgraph Generation
+      Z[&quot;Pure noise&quot;] --&gt; D1[&quot;Denoise step&quot;] --&gt; D2[&quot;Denoise step&quot;] --&gt; D3[&quot;...&quot;] --&gt; IMG[&quot;Image&quot;]
+    end
+</pre>
+</figure>
+<pre><code class="language-python">import torch, torch.nn.functional as F
+
+T = 1000
+betas = torch.linspace(1e-4, 0.02, T)
+alpha_bar = torch.cumprod(1 - betas, dim=0)
+
+def diffusion_loss(model, x0, text_emb):
+    t = torch.randint(0, T, (x0.shape[0],))
+    noise = torch.randn_like(x0)
+    a = alpha_bar[t].view(-1, 1, 1, 1)
+    xt = a.sqrt() * x0 + (1 - a).sqrt() * noise          # forward (noising) process
+    return F.mse_loss(model(xt, t, text_emb), noise)      # learn to predict the noise
+</code></pre>
+<p>Key developments:</p>
+<table>
+<thead>
+<tr>
+<th>Idea</th>
+<th>What it did</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DDPM (2020)</td>
+<td>Made diffusion work well</td>
+</tr>
+<tr>
+<td><strong>Latent diffusion</strong> / Stable Diffusion (2022)</td>
+<td>Diffuse in a compressed latent space from a VAE: ~48× fewer pixels to process</td>
+</tr>
+<tr>
+<td>Classifier-free guidance</td>
+<td>Push samples toward the text prompt; the "guidance scale" knob</td>
+</tr>
+<tr>
+<td><strong>Diffusion Transformers (DiT)</strong></td>
+<td>Replace the U-Net with a Transformer; scales better (Sora, SD3, FLUX)</td>
+</tr>
+<tr>
+<td><strong>Flow matching / rectified flow</strong></td>
+<td>Straighter paths from noise to data; fewer steps (SD3, FLUX)</td>
+</tr>
+<tr>
+<td>Distillation (LCM, consistency models, adversarial distillation)</td>
+<td>1–4 steps instead of 25–50: real-time generation</td>
+</tr>
+<tr>
+<td>Autoregressive image generation</td>
+<td>GPT-4o-style native image output from the LLM itself (2025)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Video</strong> models (OpenAI Sora, Google Veo 3, Kling, Runway, Luma, Wan, Hunyuan) extend DiTs to spacetime patches of video latents. They are among the most compute-hungry inference workloads in existence: a few seconds of high-resolution video can take GPU-minutes.</p>
+<h2>World models and robotics</h2>
+<p>Models that predict how an environment evolves (Google's Genie 3, NVIDIA Cosmos) generate interactive worlds and synthetic training data for robots. <strong>Vision-language-action (VLA)</strong> models (Physical Intelligence's π series, Google's Gemini Robotics, NVIDIA GR00T) output robot actions. Robotics is widely considered the next frontier for foundation models, limited mainly by data.</p>
+<h2>Serving generative media</h2>
+<p>Diffusion serving differs from LLM serving: work is compute-bound (big batched convolutions/attention over latents), requests are few but heavy, and optimisations include step distillation, caching intermediate features across steps, FP8/FP4 quantization, TensorRT compilation and batching across users. Many companies' "our image feature is too expensive" problems are solved with step reduction and quantization.</p>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project: Document-understanding pipeline with cost control</h3>
+<p><strong>Business problem:</strong> an insurance company receives 50,000 scanned claim documents a day and pays people to key in fields.</p>
+<ol>
+<li>Use an open VLM (e.g., a Qwen-VL-family model) served with vLLM, plus a specialised OCR model as a baseline.</li>
+<li>Extract fields to a JSON schema with structured (constrained) decoding.</li>
+<li>Measure accuracy per field, tokens per page, and pages per GPU-hour. Try lower image resolution and see where accuracy drops.</li>
+<li>Deliverable: cost per 1,000 pages vs. manual entry, and a confidence threshold that routes hard pages to a human.</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Radford et al., <em>CLIP</em> (2021); Liu et al., <em>Visual Instruction Tuning</em> (LLaVA, 2023).</li>
+<li>Ho et al., <em>DDPM</em> (2020); Rombach et al., <em>High-Resolution Image Synthesis with Latent Diffusion Models</em> (2022); Peebles and Xie, <em>DiT</em> (2023).</li>
+<li>Lilian Weng, <em>What are Diffusion Models?</em> (blog).</li>
+<li>Hugging Face <strong>diffusers</strong> documentation and course.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

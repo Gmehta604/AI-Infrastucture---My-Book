@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agents, Tools and MCP · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="22">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Agents, Tools and MCP</h1>
+<p class="lede">An agent is a model that acts: it calls tools, observes results and decides what to do next, in a loop, until a goal is met. Coding agents, research agents and computer-use agents went from demos in 2024 to major products in 2025–26. Agents also create the hardest infrastructure problems of the moment: long-running sessions, sandboxes, huge token volumes and new security risks.</p>
+</header>
+
+<h2>The agent loop</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    G[&quot;Goal from user&quot;] --&gt; C[&quot;Context: system prompt, tools, history, memory&quot;]
+    C --&gt; M[&quot;Model decides: answer, or call a tool&quot;]
+    M --&gt;|&quot;tool call (JSON)&quot;| T[&quot;Harness executes tool: search, code, API, browser, file edit&quot;]
+    T --&gt; O[&quot;Observation (result or error)&quot;]
+    O --&gt; C
+    M --&gt;|&quot;final answer&quot;| D[&quot;Done&quot;]
+    C -.-&gt;|&quot;context too long&quot;| CM[&quot;Compact / summarise / offload to memory files&quot;]
+    CM -.-&gt; C
+</pre>
+</figure>
+<p>That is the entire idea. The quality of an agent comes from (1) the model's judgement, (2) the tools and their descriptions, (3) the context you give it, and (4) the harness that runs the loop safely.</p>
+<h2>Tool calling</h2>
+<p>Models are trained to emit structured tool calls when given tool definitions (name, description, JSON Schema for arguments). Your code executes the call and returns the result.</p>
+<pre><code class="language-python">import json, subprocess, anthropic
+
+client = anthropic.Anthropic()
+tools = [
+    {&quot;name&quot;: &quot;run_python&quot;,
+     &quot;description&quot;: &quot;Execute Python code in a sandbox and return stdout/stderr. Use for calculations and data analysis.&quot;,
+     &quot;input_schema&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;code&quot;: {&quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;code&quot;]}},
+    {&quot;name&quot;: &quot;read_file&quot;,
+     &quot;description&quot;: &quot;Read a UTF-8 text file from the working directory.&quot;,
+     &quot;input_schema&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;path&quot;: {&quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;path&quot;]}},
+]
+
+def execute(name, args):
+    if name == &quot;run_python&quot;:        # in production: an isolated container / microVM, not subprocess
+        p = subprocess.run([&quot;python3&quot;, &quot;-c&quot;, args[&quot;code&quot;]], capture_output=True, text=True, timeout=30)
+        return (p.stdout + p.stderr)[-4000:]
+    if name == &quot;read_file&quot;:
+        return open(args[&quot;path&quot;]).read()[:8000]
+    return f&quot;unknown tool {name}&quot;
+
+def agent(goal, model=&quot;claude-opus-5-5&quot;, max_steps=20):
+    messages = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: goal}]
+    for step in range(max_steps):
+        resp = client.messages.create(model=model, max_tokens=4096, tools=tools, messages=messages)
+        messages.append({&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: resp.content})
+        if resp.stop_reason != &quot;tool_use&quot;:
+            return &quot;&quot;.join(b.text for b in resp.content if b.type == &quot;text&quot;)
+        results = []
+        for block in resp.content:
+            if block.type == &quot;tool_use&quot;:
+                out = execute(block.name, block.input)
+                results.append({&quot;type&quot;: &quot;tool_result&quot;, &quot;tool_use_id&quot;: block.id, &quot;content&quot;: out})
+        messages.append({&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: results})
+    return &quot;Stopped: step limit reached.&quot;
+
+print(agent(&quot;What is the 50th Fibonacci number? Verify by computing it.&quot;))
+</code></pre>
+<p>The OpenAI, Google and open-model APIs follow the same pattern with different field names. Frameworks such as the <strong>Claude Agent SDK</strong>, <strong>OpenAI Agents SDK</strong>, <strong>LangGraph</strong>, <strong>Google ADK</strong>, <strong>CrewAI</strong>, <strong>Pydantic AI</strong>, <strong>smolagents</strong> and <strong>Mastra</strong> wrap it with state management, streaming and multi-agent orchestration.</p>
+<h2>The Model Context Protocol (MCP)</h2>
+<p>Before MCP, every app wrote custom integrations for every tool. <strong>MCP</strong> (introduced by Anthropic in November 2024, adopted by OpenAI, Google, Microsoft and most of the industry in 2025, and donated to a Linux Foundation-hosted foundation in late 2025) standardises how applications expose <strong>tools</strong>, <strong>resources</strong> (data) and <strong>prompts</strong> to models.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph Host[&quot;Host app (IDE, chat app, agent)&quot;]
+      CL1[&quot;MCP client&quot;]
+      CL2[&quot;MCP client&quot;]
+    end
+    CL1 &lt;--&gt;|&quot;JSON-RPC over stdio or HTTP&quot;| S1[&quot;MCP server: GitHub&quot;]
+    CL2 &lt;--&gt;|&quot;JSON-RPC&quot;| S2[&quot;MCP server: your Postgres DB&quot;]
+    S1 --&gt; A1[&quot;GitHub API&quot;]
+    S2 --&gt; A2[&quot;Database&quot;]
+</pre>
+</figure>
+<pre><code class="language-python"># A minimal MCP server with the official Python SDK:  pip install &quot;mcp[cli]&quot;
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP(&quot;gpu-inventory&quot;)
+
+GPUS = {&quot;node-01&quot;: {&quot;gpu&quot;: &quot;H100&quot;, &quot;free&quot;: 3}, &quot;node-02&quot;: {&quot;gpu&quot;: &quot;B200&quot;, &quot;free&quot;: 0}}
+
+@mcp.tool()
+def free_gpus(gpu_type: str | None = None) -&gt; dict:
+    &quot;&quot;&quot;Return nodes with free GPUs, optionally filtered by GPU type (e.g. 'H100').&quot;&quot;&quot;
+    return {n: v for n, v in GPUS.items() if v[&quot;free&quot;] &gt; 0 and (gpu_type is None or v[&quot;gpu&quot;] == gpu_type)}
+
+@mcp.resource(&quot;inventory://all&quot;)
+def inventory() -&gt; str:
+    &quot;&quot;&quot;Full GPU inventory as JSON.&quot;&quot;&quot;
+    import json; return json.dumps(GPUS)
+
+if __name__ == &quot;__main__&quot;:
+    mcp.run()          # stdio transport; clients like Claude Code or Claude Desktop can connect
+</code></pre>
+<p>Related standards: <strong>Agent Skills</strong> (packaged instructions and scripts an agent loads on demand), <strong>A2A</strong> (Google's agent-to-agent protocol), and the OpenAI-originated <strong>AGENTS.md</strong> convention for repository instructions.</p>
+<h2>Context engineering</h2>
+<p>For long tasks, the context window is the agent's working memory and the main thing to manage.</p>
+<ul>
+<li><strong>Keep tool outputs small</strong>: return summaries, paginate, truncate.</li>
+<li><strong>Compaction</strong>: summarise old turns when nearing the limit.</li>
+<li><strong>External memory</strong>: write notes, plans and progress to files the agent can re-read (a to-do list is surprisingly powerful).</li>
+<li><strong>Sub-agents</strong>: delegate a search or investigation to a fresh context and receive only the conclusion.</li>
+<li><strong>Just-in-time retrieval</strong>: give the agent tools to look things up (grep, search) instead of stuffing everything in up front.</li>
+<li><strong>Cache-friendly structure</strong>: keep the system prompt and tool definitions stable so prompt caching works; agents re-send their whole context every step.</li>
+</ul>
+<h2>Types of agents in production (2026)</h2>
+<table>
+<thead>
+<tr>
+<th>Agent type</th>
+<th>Examples</th>
+<th>Infra needs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Coding agents</td>
+<td>Claude Code, OpenAI Codex, Cursor, GitHub Copilot agent, Devin, Gemini CLI</td>
+<td>Sandboxed dev environments, git, test runners; millions of tokens per task</td>
+</tr>
+<tr>
+<td>Research agents</td>
+<td>Deep research modes in ChatGPT, Claude, Gemini, Perplexity</td>
+<td>Web search/fetch at scale, long reports, citations</td>
+</tr>
+<tr>
+<td>Computer / browser use</td>
+<td>Claude computer use, OpenAI's agent mode, Gemini browser agents</td>
+<td>VMs with screens, screenshots as image tokens, human confirmation for risky steps</td>
+</tr>
+<tr>
+<td>Customer operations</td>
+<td>Support, sales, back office (Sierra, Decagon, etc.)</td>
+<td>Integrations via MCP/APIs, policies, handoff to humans</td>
+</tr>
+<tr>
+<td>Multi-agent systems</td>
+<td>Orchestrator plus parallel workers</td>
+<td>Coordination, cost control, result merging</td>
+</tr>
+</tbody>
+</table>
+<h2>Agent infrastructure problems</h2>
+<ol>
+<li><strong>Sandboxing.</strong> Agents run code and touch files. Use isolated containers or microVMs (Firecracker, gVisor, Kata) with no default network access, resource limits and snapshotting. E2B, Modal, Daytona and cloud providers sell this as a service.</li>
+<li><strong>Token volume.</strong> A single coding task can consume 1–20M tokens (mostly re-read context). Prompt caching and prefix-cache-aware routing are essential for cost.</li>
+<li><strong>Durability.</strong> Tasks last minutes to hours. Use durable execution (Temporal, Inngest, Restate, or queue plus checkpoints) so a crash doesn't lose progress.</li>
+<li><strong>Observability.</strong> Trace every step, tool call and token (Chapter 23).</li>
+<li><strong>Evaluation.</strong> Agents are non-deterministic; measure success rates over many runs on realistic tasks (SWE-bench Verified/Pro, Terminal-Bench, τ²-bench, OSWorld, GAIA, BrowseComp).</li>
+</ol>
+<h2>Security: the lethal trifecta</h2>
+<p>Simon Willison's framing: an agent is dangerous when it has <strong>(1) access to private data</strong>, <strong>(2) exposure to untrusted content</strong>, and <strong>(3) a way to communicate externally</strong>. <strong>Prompt injection</strong> (malicious instructions hidden in a web page, email or document) can then make it exfiltrate data.</p>
+<p>Defences, in layers: least-privilege tools; separate the model that reads untrusted content from the one holding secrets (the "dual LLM" and CaMeL patterns); allow-lists for network egress; human confirmation for irreversible actions; classifiers for injection; and logging for audit. There is no complete fix yet; design systems so a successful injection can do limited damage.</p>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project: An on-call assistant for a GPU cluster</h3>
+<p><strong>Business problem:</strong> ML engineers wait hours for the platform team to diagnose failed training jobs ("NCCL timeout", "CUDA OOM", "node unhealthy").</p>
+<ol>
+<li>Build MCP servers exposing read-only tools: job logs, <code>kubectl describe</code>, DCGM metrics, a runbook search (RAG over your runbooks).</li>
+<li>Write an agent that, given a failed job ID, gathers evidence and proposes a diagnosis and fix, citing log lines.</li>
+<li>Evaluate on 30 historical incidents (or ones you create by injecting faults into a test cluster): diagnosis accuracy, time, tokens.</li>
+<li>Add guardrails: no write actions without human approval; redact secrets from logs before they reach the model.</li>
+</ol>
+</div>
+<h2>Resources</h2>
+<ul>
+<li>Anthropic, <em>Building Effective Agents</em> (2024) and <em>Effective Context Engineering for AI Agents</em> (2025).</li>
+<li>Model Context Protocol specification and SDKs (modelcontextprotocol.io).</li>
+<li>Yao et al., <em>ReAct: Synergizing Reasoning and Acting in Language Models</em> (2022).</li>
+<li>Simon Willison's blog on prompt injection and the lethal trifecta.</li>
+<li>Jimenez et al., <em>SWE-bench</em> (2023); Terminal-Bench; METR's agent evaluations.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

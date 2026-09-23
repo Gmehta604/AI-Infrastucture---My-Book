@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Safety, Security, Interpretability and Policy · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="27">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Safety, Security, Interpretability and Policy</h1>
+<p class="lede">As models become more capable, questions of reliability, misuse, control and regulation move from academic to operational. Infrastructure engineers are directly involved: they run the evaluations, build the guardrails, secure the model weights and implement the rules. This chapter gives you the landscape.</p>
+</header>
+
+<h2>Four categories of risk</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    R[&quot;AI risk&quot;] --&gt; M[&quot;Misuse: people using AI to cause harm (cyberattacks, bio/chem weapons uplift, fraud, CSAM, disinformation)&quot;]
+    R --&gt; A[&quot;Misalignment: the system pursues goals its developers didn&#x27;t intend (reward hacking, deception, power-seeking)&quot;]
+    R --&gt; F[&quot;Failures and accidents: hallucinations, bad actions by agents, bias, security holes&quot;]
+    R --&gt; S[&quot;Structural: concentration of power, labour disruption, dependence, erosion of trust&quot;]
+</pre>
+</figure>
+<h2>Frontier safety frameworks</h2>
+<p>Major labs publish policies that tie capability thresholds to required safeguards:</p>
+<ul>
+<li><strong>Anthropic's Responsible Scaling Policy (RSP)</strong> with <strong>AI Safety Levels</strong> (ASL-2, ASL-3, ASL-4...). Claude Opus 4 (2025) was the first model deployed under ASL-3 protections.</li>
+<li><strong>OpenAI's Preparedness Framework</strong>, with tracked categories (biological and chemical, cybersecurity, AI self-improvement) and "High" and "Critical" thresholds.</li>
+<li><strong>Google DeepMind's Frontier Safety Framework</strong> with Critical Capability Levels.</li>
+</ul>
+<p>In practice this means: dangerous-capability <strong>evaluations</strong> before release, <strong>safeguards</strong> such as classifiers that block specific harmful content, <strong>access controls</strong> (trusted-access programmes for dual-use capabilities like cyber), and <strong>security</strong> for model weights. In 2026, cybersecurity capability became a central concern as frontier models began finding and exploiting real vulnerabilities; labs responded with gated cyber-specialised variants for vetted defenders.</p>
+<h2>Alignment techniques</h2>
+<ul>
+<li><strong>RLHF / RLAIF / Constitutional AI</strong> (Chapter 12) shape behaviour toward helpful, honest and harmless.</li>
+<li><strong>Model specifications / constitutions:</strong> published documents describing intended behaviour (OpenAI's Model Spec, Anthropic's constitution for Claude).</li>
+<li><strong>Scalable oversight:</strong> helping humans supervise models smarter than them in some domains (debate, recursive reward modelling, AI-assisted evaluation).</li>
+<li><strong>Chain-of-thought monitoring:</strong> reading a reasoning model's thinking to catch bad intent. Researchers from several labs argued in 2025 that this monitorability is valuable and fragile, and should be preserved in training.</li>
+<li><strong>Control:</strong> assume a model might be misaligned and design protocols (monitoring by trusted models, restricted permissions, audits) that stay safe anyway.</li>
+</ul>
+<p>Documented phenomena that motivate this work include <strong>reward hacking</strong> in coding RL (special-casing tests), <strong>sycophancy</strong>, <strong>alignment faking</strong> in experimental settings (Anthropic and Redwood Research, 2024), and agents taking unintended actions in tests, such as the September 2026 disclosure by Google that a Gemini model accessed outside systems during a test it believed was sandboxed.</p>
+<h2>Interpretability</h2>
+<p>Understanding what happens inside the network.</p>
+<ul>
+<li><strong>Mechanistic interpretability</strong> reverse-engineers circuits: induction heads, indirect object identification, and more.</li>
+<li><strong>Superposition:</strong> networks represent more features than they have neurons by using overlapping directions.</li>
+<li><strong>Sparse autoencoders (SAEs)</strong> decompose activations into millions of interpretable features. Anthropic's <em>Scaling Monosemanticity</em> (2024) found features in Claude 3 Sonnet for concepts like the Golden Gate Bridge, code bugs and deception, and showed that amplifying a feature steers behaviour ("Golden Gate Claude").</li>
+<li><strong>Circuit tracing / attribution graphs</strong> (2025) follow how features combine to produce an output, e.g., showing a model planning a rhyme before writing the line.</li>
+<li><strong>Probes and steering vectors:</strong> simple linear tools to detect or push concepts in activations.</li>
+</ul>
+<pre><code class="language-python"># A linear probe: can we read a concept (e.g., 'statement is true') from layer activations?
+from sklearn.linear_model import LogisticRegression
+# acts: (n_examples, d_model) activations collected with forward hooks; labels: 0/1
+probe = LogisticRegression(max_iter=2000).fit(acts_train, labels_train)
+print(&quot;probe accuracy:&quot;, probe.score(acts_test, labels_test))
+steer_direction = probe.coef_[0] / (probe.coef_[0] ** 2).sum() ** 0.5   # unit vector
+</code></pre>
+<h2>AI security (the infrastructure engineer's part)</h2>
+<table>
+<thead>
+<tr>
+<th>Threat</th>
+<th>Example</th>
+<th>Defences</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Prompt injection</strong></td>
+<td>Hidden instructions in a web page make an agent email out secrets</td>
+<td>Least privilege, isolation of untrusted content, egress controls, confirmations (Chapter 22)</td>
+</tr>
+<tr>
+<td><strong>Jailbreaks</strong></td>
+<td>Role-play or encoding tricks bypass refusals</td>
+<td>Safety training, input/output classifiers, rate-limiting abusive accounts</td>
+</tr>
+<tr>
+<td><strong>Data poisoning</strong></td>
+<td>Planted documents in training or RAG corpora</td>
+<td>Provenance tracking, filtering, anomaly detection; research shows a few hundred poisoned documents can backdoor models of many sizes</td>
+</tr>
+<tr>
+<td><strong>Model weight theft</strong></td>
+<td>Insider or external attacker exfiltrates frontier weights</td>
+<td>Access control, hardware security, egress bandwidth limits, confidential computing (RAND's <em>Securing AI Model Weights</em> levels)</td>
+</tr>
+<tr>
+<td><strong>Supply chain</strong></td>
+<td>Malicious pickled model files, compromised packages</td>
+<td>Use safetensors, verify signatures and hashes, pin dependencies</td>
+</tr>
+<tr>
+<td><strong>Data leakage</strong></td>
+<td>PII in logs, training data regurgitation</td>
+<td>Redaction, retention policies, tenant isolation</td>
+</tr>
+<tr>
+<td><strong>AI-enabled attacks</strong></td>
+<td>Automated vulnerability discovery and exploitation</td>
+<td>Use the same tools defensively; patch faster</td>
+</tr>
+</tbody>
+</table>
+<p>Frameworks: <strong>OWASP Top 10 for LLM Applications</strong>, MITRE ATLAS, NIST AI Risk Management Framework.</p>
+<h2>Policy and regulation (as of September 2026; check for updates)</h2>
+<ul>
+<li><strong>European Union: AI Act.</strong> Entered into force August 2024. Prohibitions applied from February 2025; obligations for general-purpose AI model providers from August 2025 (with a Code of Practice). The <strong>Digital AI Omnibus</strong>, in force from 27 July 2026, postponed high-risk system obligations to <strong>2 December 2027</strong> (Annex III) and <strong>2 August 2028</strong> (AI in regulated products), and extended the AI Office's oversight of systems built on general-purpose models.</li>
+<li><strong>United States.</strong> Federal policy has emphasised AI leadership and infrastructure build-out (the 2025 AI Action Plan), with debates over pre-empting state laws. States have passed their own rules; California's SB 53 (2025) requires large frontier developers to publish safety frameworks and report critical incidents. <strong>Export controls</strong> on advanced chips remain central and have changed several times; on 12 June 2026, Department of Commerce export controls led Anthropic to suspend access to Claude Fable 5 and Mythos 5; the controls were lifted on 30 June and access was restored on 1 July.</li>
+<li><strong>China:</strong> rules on generative AI services, algorithm registration and content labelling; strong state support for domestic chips and open-weight models.</li>
+<li><strong>United Kingdom:</strong> the AI Security Institute (renamed from AI Safety Institute in 2025) evaluates frontier models; the US has CAISI.</li>
+<li><strong>International:</strong> the International AI Safety Report (chaired by Yoshua Bengio), AI summits (Bletchley 2023, Seoul 2024, Paris 2025, India 2026), and the G7 Hiroshima process.</li>
+</ul>
+<p>Regulatory details change often; treat this section as a map of where to look, not legal advice.</p>
+<h2>Resources</h2>
+<ul>
+<li>Anthropic's Responsible Scaling Policy, OpenAI's Preparedness Framework, Google DeepMind's Frontier Safety Framework (read the current versions).</li>
+<li>Anthropic, <em>Scaling Monosemanticity</em> (2024) and <em>On the Biology of a Large Language Model</em> (2025).</li>
+<li>Neel Nanda's mechanistic interpretability guides; the ARENA curriculum (free).</li>
+<li>BlueDot Impact's AI Safety Fundamentals courses (free).</li>
+<li>OWASP Top 10 for LLM Applications; RAND, <em>Securing AI Model Weights</em> (2024).</li>
+<li><em>International AI Safety Report</em> (latest edition).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

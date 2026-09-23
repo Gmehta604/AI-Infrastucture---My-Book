@@ -1,0 +1,32 @@
+# Core (CPU-friendly; enough for most chapter examples)
+numpy>=1.26
+torch>=2.5
+matplotlib>=3.8
+pandas>=2.2
+
+# Kernels and compilers (GPU; Triton ships with CUDA builds of PyTorch on Linux)
+# triton
+
+# Serving and inference (GPU, Linux)
+# vllm
+# sglang
+
+# Fine-tuning
+transformers>=4.45
+datasets>=3.0
+peft>=0.13
+# trl
+# bitsandbytes
+
+# Applications infrastructure
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.27
+openai>=1.50
+sentence-transformers>=3.0
+faiss-cpu>=1.8
+rank-bm25>=0.2
+
+# Evals and observability
+opentelemetry-sdk>=1.27
+opentelemetry-exporter-otlp>=1.27

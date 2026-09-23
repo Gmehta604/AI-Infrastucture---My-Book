@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mixture of Experts and Modern Architectures · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="11">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Mixture of Experts and Modern Architectures</h1>
+<p class="lede">The 2017 Transformer has been refined rather than replaced. The biggest change is sparsity: mixture-of-experts models with hundreds of billions or trillions of parameters, of which only a small fraction runs per token. This chapter covers MoE, long context, and the linear-attention and state-space hybrids reshaping 2026 architectures.</p>
+</header>
+
+<h2>Mixture of Experts (MoE)</h2>
+<p>A dense model uses every parameter for every token. An MoE layer replaces the single FFN with <strong>many expert FFNs</strong> and a small <strong>router</strong> that picks the top-k experts for each token.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    X[&quot;Token hidden state&quot;] --&gt; R[&quot;Router: linear layer + softmax&quot;]
+    R --&gt;|&quot;top-k scores&quot;| S{&quot;Select k of E experts&quot;}
+    S --&gt; E1[&quot;Expert 3&quot;]
+    S --&gt; E2[&quot;Expert 17&quot;]
+    X --&gt; SH[&quot;Shared expert (always on)&quot;]
+    E1 --&gt; C[&quot;Weighted sum&quot;]
+    E2 --&gt; C
+    SH --&gt; C
+    C --&gt; Y[&quot;Output&quot;]
+</pre>
+</figure>
+<p><strong>Why it works:</strong> capacity (total parameters, which store knowledge) is decoupled from compute (active parameters per token). DeepSeek-V3 has 671B total parameters but activates only 37B per token, so it computes like a ~37B dense model while knowing like a much bigger one.</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Total params</th>
+<th>Active params</th>
+<th>Experts (routed / active)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mixtral 8x7B (2023)</td>
+<td>47B</td>
+<td>13B</td>
+<td>8 / 2</td>
+</tr>
+<tr>
+<td>DeepSeek-V3 / R1 (2024–25)</td>
+<td>671B</td>
+<td>37B</td>
+<td>256 / 8 + 1 shared</td>
+</tr>
+<tr>
+<td>Qwen3-235B-A22B (2025)</td>
+<td>235B</td>
+<td>22B</td>
+<td>128 / 8</td>
+</tr>
+<tr>
+<td>Kimi K2 (2025)</td>
+<td>~1T</td>
+<td>32B</td>
+<td>384 / 8 + 1 shared</td>
+</tr>
+<tr>
+<td>gpt-oss-120b (2025)</td>
+<td>117B</td>
+<td>5.1B</td>
+<td>128 / 4</td>
+</tr>
+<tr>
+<td>GLM-5.x, DeepSeek V4, Qwen3.x-Max, Kimi K3 (2026)</td>
+<td>Several hundred B to multiple T</td>
+<td>Tens of B</td>
+<td>Fine-grained, many experts</td>
+</tr>
+</tbody>
+</table>
+<p>Frontier closed models are widely believed to be MoE as well, though labs rarely confirm details.</p>
+<h3>Implementing an MoE layer</h3>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+class Expert(nn.Module):
+    def __init__(self, d, h):
+        super().__init__()
+        self.gate, self.up, self.down = nn.Linear(d, h, bias=False), nn.Linear(d, h, bias=False), nn.Linear(h, d, bias=False)
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+class MoE(nn.Module):
+    def __init__(self, d=512, h=1024, n_experts=16, top_k=2):
+        super().__init__()
+        self.router = nn.Linear(d, n_experts, bias=False)
+        self.experts = nn.ModuleList(Expert(d, h) for _ in range(n_experts))
+        self.shared = Expert(d, h)
+        self.k, self.E = top_k, n_experts
+
+    def forward(self, x):
+        B, T, d = x.shape
+        flat = x.reshape(-1, d)                              # (N, d) tokens
+        probs = F.softmax(self.router(flat), dim=-1)         # (N, E)
+        topw, topi = probs.topk(self.k, dim=-1)              # (N, k)
+        topw = topw / topw.sum(-1, keepdim=True)
+        out = torch.zeros_like(flat)
+        for e in range(self.E):                              # dispatch per expert
+            rows, slot = (topi == e).nonzero(as_tuple=True)
+            if rows.numel():
+                out[rows] += topw[rows, slot, None] * self.experts[e](flat[rows])
+        # load-balancing auxiliary loss (Switch Transformer style)
+        frac_tokens = F.one_hot(topi[:, 0], self.E).float().mean(0)
+        frac_prob = probs.mean(0)
+        aux = self.E * (frac_tokens * frac_prob).sum()
+        return (out + self.shared(flat)).view(B, T, d), aux
+
+y, aux = MoE()(torch.randn(2, 16, 512))
+print(y.shape, aux.item())
+</code></pre>
+<p>The Python loop is for clarity. Production systems group tokens by expert and run <strong>grouped GEMMs</strong> (one kernel for many small matmuls), and in distributed training they send tokens to experts on other GPUs with an <strong>all-to-all</strong> collective (expert parallelism, Chapter 17).</p>
+<h3>MoE engineering problems</h3>
+<ol>
+<li><strong>Load balancing.</strong> If the router sends most tokens to a few experts, those GPUs overload while others idle. Fixes: an auxiliary balancing loss (above), or DeepSeek's <strong>auxiliary-loss-free</strong> method that adds a per-expert bias adjusted during training.</li>
+<li><strong>Communication.</strong> All-to-all traffic between GPUs is heavy; this is why NVLink domains of 72 GPUs (GB200/GB300 NVL72) are so valuable for MoE.</li>
+<li><strong>Memory.</strong> You must hold <em>all</em> experts in memory even though few are active. Serving a 1T-parameter MoE needs many GPUs even if compute per token is small.</li>
+<li><strong>Training instability.</strong> Router logits can blow up; z-loss and careful initialisation help.</li>
+</ol>
+<h2>Long context</h2>
+<p>Context windows grew from 2K tokens (GPT-3) to 128K (2023–24) to 1M+ (Gemini 1.5 onward; common in 2026 open models). Ingredients:</p>
+<ul>
+<li><strong>RoPE scaling</strong> (position interpolation, NTK-aware scaling, <strong>YaRN</strong>) to extend a model trained on short sequences.</li>
+<li><strong>Long-context training stages</strong> near the end of pretraining with progressively longer sequences.</li>
+<li><strong>Efficient attention kernels</strong> (FlashAttention) so memory grows linearly, not quadratically.</li>
+<li><strong>Context parallelism / ring attention</strong> to split one long sequence across GPUs (Chapter 17).</li>
+<li><strong>Sparse and sliding-window attention</strong>: attend fully to recent tokens and sparsely to distant ones. Mistral and Gemma interleave sliding-window and global layers; DeepSeek's <strong>native sparse attention</strong> (NSA) and DSA select only relevant blocks of the past.</li>
+</ul>
+<p>Evaluate long context with <strong>needle-in-a-haystack</strong>, RULER and multi-hop long-document tasks. "Supports 1M tokens" and "uses 1M tokens well" are different claims.</p>
+<h2>State-space models and linear attention</h2>
+<p>Attention's KV cache grows with context, and its compute grows quadratically. <strong>Recurrent</strong> alternatives keep a fixed-size state, just like RNNs, but are designed to train in parallel:</p>
+<ul>
+<li><strong>Mamba / Mamba-2</strong> (2023–24): selective state-space models with input-dependent dynamics and a hardware-aware parallel scan.</li>
+<li><strong>RWKV</strong>, <strong>RetNet</strong>, <strong>Gated Linear Attention</strong>.</li>
+<li><strong>Gated DeltaNet</strong> (2024): linear attention with a "delta rule" update that overwrites stale memories.</li>
+</ul>
+<p>Pure recurrent models lag at precise recall ("what was the 7th item in the list?"). The winning pattern is the <strong>hybrid</strong>: mostly linear/SSM layers with a few full attention layers.</p>
+<table>
+<thead>
+<tr>
+<th>Hybrid model</th>
+<th>Mix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Jamba (AI21, 2024)</td>
+<td>Mamba + attention + MoE</td>
+</tr>
+<tr>
+<td>NVIDIA Nemotron-H / Nemotron 3 (2025)</td>
+<td>Mostly Mamba-2 with a few attention layers; MoE in Nemotron 3</td>
+</tr>
+<tr>
+<td>Qwen3-Next / Qwen3.5+ (2025–26)</td>
+<td>Gated DeltaNet + gated attention, roughly 3:1, with sparse MoE</td>
+</tr>
+<tr>
+<td>MiniMax-01 (2025)</td>
+<td>Lightning (linear) attention + softmax attention</td>
+</tr>
+</tbody>
+</table>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    subgraph Hybrid[&quot;Hybrid stack (e.g., 3 linear : 1 full attention)&quot;]
+      L1[&quot;Linear-attention / SSM layer (fixed-size state)&quot;] --&gt; L2[&quot;Linear-attention / SSM layer&quot;]
+      L2 --&gt; L3[&quot;Linear-attention / SSM layer&quot;]
+      L3 --&gt; A4[&quot;Full softmax attention layer (KV cache)&quot;]
+      A4 --&gt; M[&quot;MoE feed-forward in every layer&quot;]
+    end
+</pre>
+</figure>
+<p>Infrastructure impact: hybrids cut KV cache memory by roughly the fraction of non-attention layers, allowing much larger batches and longer contexts per GPU. Serving engines (vLLM, SGLang) had to add support for mixed cache types.</p>
+<h2>Other architectural refinements you will see</h2>
+<ul>
+<li><strong>Multi-token prediction (MTP):</strong> train extra heads to predict tokens 2, 3… ahead. Improves training signal and enables speculative decoding for free (DeepSeek-V3).</li>
+<li><strong>QK-norm, logit soft-capping:</strong> stability at scale.</li>
+<li><strong>No biases, untied or tied embeddings, larger vocabularies.</strong></li>
+<li><strong>Attention sinks and gated attention:</strong> control the tendency of attention to dump weight on the first token.</li>
+<li><strong>Diffusion language models</strong> (e.g., Inception's Mercury, Google's Gemini Diffusion research): generate many tokens in parallel by iterative denoising rather than left-to-right, promising much faster decoding.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>Fedus et al., <em>Switch Transformers</em> (2021); Shazeer et al., <em>Outrageously Large Neural Networks</em> (2017).</li>
+<li>DeepSeek-AI, <em>DeepSeekMoE</em> (2024) and the V3 technical report.</li>
+<li>Gu and Dao, <em>Mamba</em> (2023) and <em>Transformers are SSMs</em> (Mamba-2, 2024).</li>
+<li>Yang et al., <em>Gated Delta Networks</em> (2024).</li>
+<li>Sebastian Raschka, <em>The Big LLM Architecture Comparison</em> (blog, updated through 2025–26).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

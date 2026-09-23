@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Attention and the Transformer · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="9">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Attention and the Transformer</h1>
+<p class="lede">This is the most important chapter in the book. Every frontier model in 2026 (GPT, Claude, Gemini, Llama, DeepSeek, Qwen) is a descendant of the architecture here. By the end you will have written a modern Llama-style Transformer from scratch.</p>
+</header>
+
+<h2>The big picture</h2>
+<p>A decoder-only Transformer (the GPT family) is a stack of identical <strong>blocks</strong>. Each block has two sub-layers: <strong>attention</strong>, where tokens exchange information, and a <strong>feed-forward network (MLP)</strong>, where each token processes what it gathered. Both are wrapped in normalisation and residual connections.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    T[&quot;Token IDs&quot;] --&gt; E[&quot;Token embedding&quot;]
+    E --&gt; B1
+    subgraph B1[&quot;Transformer block (repeated L times)&quot;]
+      direction TB
+      N1[&quot;RMSNorm&quot;] --&gt; ATT[&quot;Causal multi-head self-attention (with RoPE)&quot;]
+      ATT --&gt; R1((&quot;+ residual&quot;))
+      R1 --&gt; N2[&quot;RMSNorm&quot;]
+      N2 --&gt; FFN[&quot;Feed-forward (SwiGLU MLP)&quot;]
+      FFN --&gt; R2((&quot;+ residual&quot;))
+    end
+    B1 --&gt; NF[&quot;Final RMSNorm&quot;]
+    NF --&gt; LM[&quot;LM head: linear to vocab&quot;]
+    LM --&gt; SM[&quot;Softmax: next-token probabilities&quot;]
+</pre>
+</figure>
+<p>Architectures come in three flavours:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Attention</th>
+<th>Examples</th>
+<th>Good at</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Encoder-only</td>
+<td>Bidirectional</td>
+<td>BERT, embedding models</td>
+<td>Classification, embeddings, rerankers</td>
+</tr>
+<tr>
+<td>Encoder-decoder</td>
+<td>Bidirectional encoder, causal decoder</td>
+<td>T5, Whisper, original Transformer</td>
+<td>Translation, speech</td>
+</tr>
+<tr>
+<td><strong>Decoder-only</strong></td>
+<td>Causal (only look left)</td>
+<td>GPT, Claude, Llama, all frontier chat models</td>
+<td>Generation; the dominant design</td>
+</tr>
+</tbody>
+</table>
+<h2>Self-attention, precisely</h2>
+<p>Each token's vector <code>x</code> is projected into three vectors with learned matrices:</p>
+<ul>
+<li><strong>Query</strong> <code>q = x·W_Q</code>: "what am I looking for?"</li>
+<li><strong>Key</strong> <code>k = x·W_K</code>: "what do I contain?"</li>
+<li><strong>Value</strong> <code>v = x·W_V</code>: "what do I pass on if selected?"</li>
+</ul>
+<p>For a sequence packed into matrices Q, K, V (each of shape T × d):</p>
+<div class="math">Attention(Q, K, V) = softmax( Q·Kᵀ / √d  +  mask ) · V</div>
+
+<ul>
+<li><code>Q·Kᵀ</code> is a T×T matrix of dot products: how relevant each token is to each other token.</li>
+<li>Dividing by <code>√d</code> keeps scores from growing with dimension, which would saturate the softmax.</li>
+<li>The <strong>causal mask</strong> sets scores for future positions to −∞, so token t can only see tokens ≤ t. This is what lets one training sequence provide T training examples at once.</li>
+<li>Softmax turns each row into weights; multiplying by V blends the values.</li>
+</ul>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    X[&quot;X (T x d_model)&quot;] --&gt; Q[&quot;Q = X·Wq&quot;]
+    X --&gt; K[&quot;K = X·Wk&quot;]
+    X --&gt; V[&quot;V = X·Wv&quot;]
+    Q --&gt; S[&quot;Scores = Q·Kᵀ / √d&quot;]
+    K --&gt; S
+    S --&gt; M[&quot;Add causal mask (-inf above diagonal)&quot;]
+    M --&gt; P[&quot;Softmax per row&quot;]
+    P --&gt; O[&quot;Output = P·V&quot;]
+    V --&gt; O
+</pre>
+</figure>
+<h3>Multi-head attention</h3>
+<p>Instead of one attention with d=4096, split into, say, 32 <strong>heads</strong> of 128 dimensions. Each head can attend to different things: one tracks syntax, another the previous token, another a named entity. Outputs are concatenated and mixed by an output projection <code>W_O</code>.</p>
+<h3>Grouped-query attention (GQA) and friends</h3>
+<p>At inference, the model caches K and V for every past token (the <strong>KV cache</strong>, Chapter 19). With 32 heads, that cache is large. Variants shrink it:</p>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>K/V heads</th>
+<th>KV cache size</th>
+<th>Used by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Multi-head (MHA)</td>
+<td>Same as query heads (e.g., 32)</td>
+<td>1×</td>
+<td>GPT-2, GPT-3</td>
+</tr>
+<tr>
+<td>Multi-query (MQA)</td>
+<td>1</td>
+<td>1/32×</td>
+<td>PaLM, Falcon</td>
+</tr>
+<tr>
+<td><strong>Grouped-query (GQA)</strong></td>
+<td>A few groups (e.g., 8)</td>
+<td>1/4×</td>
+<td>Llama 2 70B+, Llama 3, Qwen, Mistral</td>
+</tr>
+<tr>
+<td><strong>Multi-head latent (MLA)</strong></td>
+<td>Compressed low-rank latent</td>
+<td>~1/10× or less</td>
+<td>DeepSeek V2/V3/V4, Kimi K2</td>
+</tr>
+</tbody>
+</table>
+<p>MLA stores a small compressed vector per token and reconstructs keys and values from it. It is one reason DeepSeek serves so cheaply.</p>
+<h2>The feed-forward network</h2>
+<p>After attention, each token passes independently through an MLP that expands to a larger hidden size and back. Modern models use <strong>SwiGLU</strong>:</p>
+<div class="math">FFN(x) = W_down · ( SiLU(x·W_gate) ⊙ (x·W_up) )</div>
+
+<p>The FFN holds about two-thirds of a dense model's parameters and is where much factual knowledge appears to be stored. In <strong>mixture-of-experts</strong> models (Chapter 11), it is replaced by many expert FFNs, with only a few active per token.</p>
+<h2>Where the parameters and FLOPs go</h2>
+<p>For a model with <code>d_model = d</code>, <code>L</code> layers, a SwiGLU FFN of hidden size <code>d_ff</code>, and vocabulary <code>V</code>:</p>
+<ul>
+<li>Attention per layer: about <code>4d²</code> parameters (Q, K, V, O; less with GQA).</li>
+<li>SwiGLU FFN per layer: <code>3 · d · d_ff</code> (with <code>d_ff ≈ 2.7d–3.5d</code>, about <code>8d²–10d²</code>).</li>
+<li>Total ≈ <code>L · 12d²</code> plus embeddings <code>V·d</code> (a rough rule for standard FFN sizes).</li>
+</ul>
+<p>Llama-3-8B: d=4096, L=32, d_ff=14,336, GQA with 8 KV heads, V=128,256 → about 8.0B parameters. Try computing it yourself.</p>
+<pre><code class="language-python">d, L, dff, V, n_kv, hd = 4096, 32, 14336, 128256, 8, 128
+attn = d*d + 2*d*(n_kv*hd) + d*d          # Wq, Wk, Wv (GQA), Wo
+ffn = 3 * d * dff
+total = L*(attn + ffn + 2*d) + 2*V*d + d  # untied embedding and LM head
+print(f&quot;{total/1e9:.2f}B&quot;)                # ≈ 8.03B
+</code></pre>
+<h2>Build a modern GPT from scratch</h2>
+<p>This is a compact but real Llama-style model: RMSNorm, RoPE, GQA, SwiGLU, weight tying, causal attention through PyTorch's fused <code>scaled_dot_product_attention</code> (which dispatches to FlashAttention on GPUs), and generation with a KV cache.</p>
+<pre><code class="language-python">import math, torch, torch.nn as nn, torch.nn.functional as F
+from dataclasses import dataclass
+
+@dataclass
+class Config:
+    vocab: int = 32_000
+    d: int = 512
+    n_layers: int = 8
+    n_heads: int = 8
+    n_kv_heads: int = 2          # GQA: 4 query heads share each K/V head
+    ffn_mult: float = 8 / 3
+    max_len: int = 1024
+    rope_base: float = 10_000.0
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-6):
+        super().__init__(); self.eps = eps; self.w = nn.Parameter(torch.ones(d))
+    def forward(self, x):
+        return self.w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+def rope_tables(head_dim, max_len, base):
+    inv = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    ang = torch.outer(torch.arange(max_len).float(), inv)       # (T, hd/2)
+    return ang.cos(), ang.sin()
+
+def apply_rope(x, cos, sin):
+    # x: (B, H, T, hd). Rotate each pair (x1, x2) by the position's angle.
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    out = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    return out.flatten(-2)
+
+class Attention(nn.Module):
+    def __init__(self, c: Config):
+        super().__init__()
+        self.h, self.kvh, self.hd = c.n_heads, c.n_kv_heads, c.d // c.n_heads
+        self.wq = nn.Linear(c.d, self.h * self.hd, bias=False)
+        self.wk = nn.Linear(c.d, self.kvh * self.hd, bias=False)
+        self.wv = nn.Linear(c.d, self.kvh * self.hd, bias=False)
+        self.wo = nn.Linear(self.h * self.hd, c.d, bias=False)
+
+    def forward(self, x, cos, sin, cache=None):
+        B, T, _ = x.shape
+        q = self.wq(x).view(B, T, self.h, self.hd).transpose(1, 2)
+        k = self.wk(x).view(B, T, self.kvh, self.hd).transpose(1, 2)
+        v = self.wv(x).view(B, T, self.kvh, self.hd).transpose(1, 2)
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        if cache is not None:                          # append to KV cache
+            if cache.get(&quot;k&quot;) is not None:
+                k = torch.cat([cache[&quot;k&quot;], k], dim=2)
+                v = torch.cat([cache[&quot;v&quot;], v], dim=2)
+            cache[&quot;k&quot;], cache[&quot;v&quot;] = k, v
+        rep = self.h // self.kvh                       # expand K/V heads for GQA
+        k, v = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
+        # causal only when processing more than one new token (prefill/training)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=(T &gt; 1 and k.shape[2] == T))
+        return self.wo(y.transpose(1, 2).reshape(B, T, -1))
+
+class SwiGLU(nn.Module):
+    def __init__(self, c: Config):
+        super().__init__()
+        hidden = int(c.ffn_mult * c.d)
+        self.gate = nn.Linear(c.d, hidden, bias=False)
+        self.up = nn.Linear(c.d, hidden, bias=False)
+        self.down = nn.Linear(hidden, c.d, bias=False)
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+class Block(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.n1, self.attn, self.n2, self.ffn = RMSNorm(c.d), Attention(c), RMSNorm(c.d), SwiGLU(c)
+    def forward(self, x, cos, sin, cache=None):
+        x = x + self.attn(self.n1(x), cos, sin, cache)   # pre-norm + residual
+        return x + self.ffn(self.n2(x))
+
+class GPT(nn.Module):
+    def __init__(self, c: Config):
+        super().__init__()
+        self.c = c
+        self.emb = nn.Embedding(c.vocab, c.d)
+        self.blocks = nn.ModuleList(Block(c) for _ in range(c.n_layers))
+        self.norm = RMSNorm(c.d)
+        self.head = nn.Linear(c.d, c.vocab, bias=False)
+        self.head.weight = self.emb.weight               # weight tying
+        cos, sin = rope_tables(c.d // c.n_heads, c.max_len, c.rope_base)
+        self.register_buffer(&quot;cos&quot;, cos, persistent=False)
+        self.register_buffer(&quot;sin&quot;, sin, persistent=False)
+        self.apply(self._init)                           # small init keeps initial logits sane
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None, caches=None, start=0):
+        T = idx.shape[1]
+        cos, sin = self.cos[start:start + T], self.sin[start:start + T]
+        x = self.emb(idx)
+        for i, blk in enumerate(self.blocks):
+            x = blk(x, cos, sin, None if caches is None else caches[i])
+        logits = self.head(self.norm(x))
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new=50, temperature=0.8, top_p=0.95):
+        caches = [dict() for _ in self.blocks]
+        logits, _ = self(idx, caches=caches)            # prefill: whole prompt at once
+        pos = idx.shape[1]
+        for _ in range(max_new):                         # decode: one token per step
+            probs = F.softmax(logits[:, -1] / temperature, dim=-1)
+            sp, si = probs.sort(descending=True)         # nucleus (top-p) sampling
+            sp[(sp.cumsum(-1) - sp) &gt; top_p] = 0
+            nxt = si.gather(-1, torch.multinomial(sp / sp.sum(-1, keepdim=True), 1))
+            idx = torch.cat([idx, nxt], dim=1)
+            logits, _ = self(nxt, caches=caches, start=pos)
+            pos += 1
+        return idx
+
+model = GPT(Config())
+print(sum(p.numel() for p in model.parameters()) / 1e6, &quot;M params&quot;)
+x = torch.randint(0, 32_000, (2, 64))
+logits, loss = model(x[:, :-1], targets=x[:, 1:])
+print(logits.shape, loss.item())          # loss ≈ ln(32000) ≈ 10.4 at init
+print(model.generate(x[:, :8], max_new=5).shape)
+</code></pre>
+<p>Notice the two phases in <code>generate</code>: <strong>prefill</strong> processes the prompt in one parallel pass; <strong>decode</strong> then feeds one token at a time, reusing cached keys and values. The entire field of inference optimisation (Chapter 19) is about making these two phases fast.</p>
+<h2>Training it on real text</h2>
+<pre><code class="language-python"># Tiny Shakespeare with a character-level vocab, to see learning in minutes
+text = open(&quot;input.txt&quot;).read()   # download tinyshakespeare from Karpathy's char-rnn repo
+chars = sorted(set(text)); stoi = {c: i for i, c in enumerate(chars)}
+data = torch.tensor([stoi[c] for c in text])
+cfg = Config(vocab=len(chars), d=256, n_layers=6, n_heads=8, n_kv_heads=2, max_len=256)
+model = GPT(cfg).cuda()
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.1)
+for step in range(3000):
+    ix = torch.randint(len(data) - 257, (64,))
+    xb = torch.stack([data[i:i + 256] for i in ix]).cuda()
+    yb = torch.stack([data[i + 1:i + 257] for i in ix]).cuda()
+    with torch.autocast(&quot;cuda&quot;, dtype=torch.bfloat16):
+        _, loss = model(xb, yb)
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 500 == 0: print(step, loss.item())
+</code></pre>
+<h2>Decoding strategies</h2>
+<table>
+<thead>
+<tr>
+<th>Strategy</th>
+<th>How</th>
+<th>Use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Greedy</td>
+<td>Always pick the most likely token</td>
+<td>Deterministic tasks; can loop</td>
+</tr>
+<tr>
+<td>Temperature</td>
+<td>Scale logits before softmax</td>
+<td>Control randomness</td>
+</tr>
+<tr>
+<td>Top-k</td>
+<td>Sample from the k most likely</td>
+<td>Cut off the long tail</td>
+</tr>
+<tr>
+<td>Top-p (nucleus)</td>
+<td>Sample from the smallest set with cumulative prob ≥ p</td>
+<td>Default for chat</td>
+</tr>
+<tr>
+<td>Min-p</td>
+<td>Keep tokens with prob ≥ p × max prob</td>
+<td>Popular in open-model community</td>
+</tr>
+<tr>
+<td>Beam search</td>
+<td>Track several candidate sequences</td>
+<td>Translation; rarely for chat</td>
+</tr>
+<tr>
+<td>Constrained / structured</td>
+<td>Mask tokens that would break a grammar (JSON schema)</td>
+<td>Reliable JSON and tool calls</td>
+</tr>
+</tbody>
+</table>
+<h2>What a Transformer learns internally</h2>
+<p>Interpretability research has found recognisable circuits: <strong>induction heads</strong> that copy patterns ("if A was followed by B before, predict B after A again"), which underlie in-context learning; features for concepts that can be found with <strong>sparse autoencoders</strong>; and attention heads that track syntax. Chapter 27 returns to this.</p>
+<h2>Resources</h2>
+<ul>
+<li>Karpathy, <em>Let's build GPT: from scratch, in code, spelled out</em> (YouTube) and the <strong>nanoGPT</strong> / <strong>nanochat</strong> repositories.</li>
+<li>Jay Alammar, <em>The Illustrated Transformer</em> and <em>The Illustrated GPT-2</em>.</li>
+<li>Harvard NLP, <em>The Annotated Transformer</em>.</li>
+<li>Anthropic, <em>A Mathematical Framework for Transformer Circuits</em> (2021).</li>
+<li>Sebastian Raschka, <em>Build a Large Language Model (From Scratch)</em> (book, 2024).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

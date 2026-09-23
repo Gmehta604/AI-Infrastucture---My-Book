@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chapter title</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<!-- Set data-chapter to the chapter number. book.js adds the header, sidebar and footer. -->
+<body data-chapter="0">
+<!-- For a deep dive, use <body data-deep="FILE-NAME.html"> instead, matching its DEEP_DIVES entry in book.js. -->
+<article class="chapter">
+
+  <header class="chap-head">
+    <h1>Chapter title</h1>
+    <p class="lede">One or two sentences on what this chapter covers and why it matters.</p>
+    <div class="meta-row">
+      <span class="chip">~60 min read</span>
+      <span class="chip">Prerequisites: Chapter N</span>
+    </div>
+  </header>
+
+  <div class="objectives">
+    <strong>You will be able to</strong>
+    <ul>
+      <li>First learning objective</li>
+      <li>Second learning objective</li>
+    </ul>
+  </div>
+
+  <h2>A section heading</h2>
+  <p>Body text. Use <code>inline code</code> for identifiers.</p>
+
+  <!-- A formula -->
+  <div class="math">time per token ≥ bytes read ÷ memory bandwidth</div>
+
+  <!-- A diagram -->
+  <figure class="diagram">
+    <pre class="mermaid">
+flowchart LR
+    A["Input"] --> B["Process"] --> C["Output"]
+    </pre>
+    <figcaption>What the diagram shows.</figcaption>
+  </figure>
+
+  <!-- A code block with an optional file-name label -->
+  <span class="code-title">code/ch00/example.py</span>
+  <pre><code class="language-python">print("hello")</code></pre>
+
+  <!-- A table -->
+  <table>
+    <thead><tr><th>Column</th><th>Column</th></tr></thead>
+    <tbody><tr><td>Value</td><td>Value</td></tr></tbody>
+  </table>
+
+  <!-- Callouts: default (key idea), .warn (pitfall), .industry (how companies do it) -->
+  <div class="callout"><strong>Key idea</strong><p>The single sentence to remember.</p></div>
+  <div class="callout warn"><strong>Pitfall</strong><p>A common mistake and how to avoid it.</p></div>
+  <div class="callout industry"><strong>In industry</strong><p>How real teams handle this.</p></div>
+
+  <!-- A worked example -->
+  <div class="worked"><strong>Worked example</strong><p>Step-by-step calculation.</p></div>
+
+  <!-- Exercises with hidden answers -->
+  <h2>Exercises</h2>
+  <div class="exercises">
+    <div class="exercise">
+      <p>Question text.</p>
+      <details class="answer"><summary>Show answer</summary><p>Answer text.</p></details>
+    </div>
+  </div>
+
+  <!-- Project box -->
+  <div class="build">
+    <strong>Build it</strong>
+    <h3>Project name</h3>
+    <p><b>Business problem:</b> …</p>
+    <ol><li>Step one</li><li>Step two</li></ol>
+  </div>
+
+  <h2>Further reading</h2>
+  <ul><li>Resource</li></ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

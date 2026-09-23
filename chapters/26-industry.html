@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The AI Industry Map · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="26">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>The AI Industry Map</h1>
+<p class="lede">To have knowledge "like no one else", you need the business picture as well as the technical one: who builds what, who pays whom, where the bottlenecks and margins are, and where the jobs are. This chapter maps the industry layer by layer.</p>
+</header>
+
+<h2>The stack as an industry</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    L7[&quot;Applications: ChatGPT, Claude, Gemini apps, Copilot, Cursor, Perplexity, vertical AI (legal, medical, finance), agents&quot;]
+    L6[&quot;Tooling and middleware: gateways, vector DBs, eval and observability, agent frameworks, data labelling&quot;]
+    L5[&quot;Models: frontier labs (closed) and open-weight labs&quot;]
+    L4[&quot;Inference and training platforms: API providers, serverless GPU, fine-tuning services&quot;]
+    L3[&quot;Cloud and compute: hyperscalers and neoclouds&quot;]
+    L2[&quot;Systems: servers, racks, networking, storage (Dell, Supermicro, HPE, Foxconn, Arista, NVIDIA networking)&quot;]
+    L1[&quot;Chips: NVIDIA, AMD, Google TPU, AWS Trainium, Broadcom and Marvell (custom ASICs), startups&quot;]
+    L0[&quot;Foundations: TSMC fabs, HBM (SK hynix, Samsung, Micron), ASML lithography, energy and data centers&quot;]
+    L7 --&gt; L6 --&gt; L5 --&gt; L4 --&gt; L3 --&gt; L2 --&gt; L1 --&gt; L0
+</pre>
+</figure>
+<h2>Layer by layer</h2>
+<h3>Foundations and chips</h3>
+<ul>
+<li><strong>TSMC</strong> fabricates nearly every leading AI accelerator (NVIDIA, AMD, Google TPU, AWS Trainium, Apple). Its <strong>CoWoS</strong> advanced packaging capacity has been a chronic bottleneck.</li>
+<li><strong>HBM</strong> memory makers (SK hynix leads, then Samsung and Micron) are the other choke point; HBM is a large fraction of accelerator cost.</li>
+<li><strong>NVIDIA</strong> holds the large majority of the AI accelerator market, with data-center revenue in the hundreds of billions per year by 2026 and a platform strategy spanning chips, NVLink, networking, software (CUDA, Dynamo, NeMo, NIM) and whole racks.</li>
+<li><strong>Custom silicon (ASICs):</strong> Google TPU (designed with Broadcom), AWS Trainium (with Marvell and Alchip), Meta MTIA, Microsoft Maia, and OpenAI's custom chip with Broadcom. Hyperscalers want to reduce dependence on NVIDIA's margins.</li>
+<li><strong>AMD</strong> is the main merchant-GPU alternative, with MI300/MI350 series and a 2026 rack-scale push; OpenAI signed a multi-gigawatt deal with AMD in 2025.</li>
+</ul>
+<h3>Cloud and compute</h3>
+<ul>
+<li><strong>Hyperscalers:</strong> AWS, Microsoft Azure, Google Cloud, Oracle (OCI grew quickly on AI deals), plus Alibaba Cloud and others in China.</li>
+<li><strong>Neoclouds:</strong> CoreWeave (public since 2025), Nebius, Lambda, Crusoe, Together AI, Fluidstack and many more. They specialise in large GPU clusters, often with contracts from labs and hyperscalers.</li>
+<li><strong>Deal structures</strong> have become financial engineering: multi-year take-or-pay contracts, GPUs used as loan collateral, vendor financing, and circular investments (chip makers investing in the labs that buy their chips). Understanding these helps you read the news critically.</li>
+</ul>
+<h3>Model developers</h3>
+<table>
+<thead>
+<tr>
+<th>Group</th>
+<th>Examples</th>
+<th>Business model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Frontier closed labs</td>
+<td>OpenAI, Anthropic, Google DeepMind, xAI, Meta Superintelligence Labs</td>
+<td>API + consumer subscriptions + enterprise; massive compute deals</td>
+</tr>
+<tr>
+<td>Open-weight labs (China)</td>
+<td>DeepSeek, Alibaba Qwen, Moonshot (Kimi), Zhipu (GLM), MiniMax, ByteDance Seed, Tencent, StepFun</td>
+<td>Open weights drive adoption; revenue from cloud, APIs, ecosystems</td>
+</tr>
+<tr>
+<td>Open-weight labs (West)</td>
+<td>Meta Llama, Mistral, Google Gemma, OpenAI gpt-oss, NVIDIA Nemotron, AI2 OLMo (fully open), Microsoft Phi, IBM Granite</td>
+<td>Ecosystem, enterprise, hardware pull-through</td>
+</tr>
+<tr>
+<td>Specialised</td>
+<td>ElevenLabs (voice), Black Forest Labs (images), Runway / Luma (video), Cohere (enterprise), Reka, Liquid AI, Physical Intelligence (robotics)</td>
+<td>Focused products and APIs</td>
+</tr>
+<tr>
+<td>New research labs</td>
+<td>Safe Superintelligence, Thinking Machines Lab, Reflection AI, and others</td>
+<td>Large raises, research-first</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Open vs closed:</strong> in 2026, the best open-weight models trail the best closed ones by a few months to a year on most benchmarks, and occasionally lead in specific areas. Open weights matter for data residency, customisation, cost at scale, and research. Licences differ (MIT and Apache 2.0 vs custom licences with usage restrictions), so read them.</p>
+<h3>Inference platforms</h3>
+<p>Together AI, Fireworks, Baseten, Groq, Cerebras, DeepInfra, Replicate, Modal, OpenRouter, AWS Bedrock, Google Vertex AI, Azure AI Foundry. They compete on price per token, latency, model selection and reliability. Margins depend on exactly the inference engineering you learned in Chapter 19.</p>
+<h3>Tooling</h3>
+<p>Vector databases, LLM gateways, evaluation and observability (Langfuse, Braintrust, Arize, LangSmith), agent frameworks, data labelling and RL-environment vendors (Scale AI, Surge AI, Mercor, Turing, Labelbox, Handshake), GPU orchestration (Run:ai, now part of NVIDIA; SkyPilot; dstack), and sandbox providers (E2B, Daytona, Modal).</p>
+<h3>Applications</h3>
+<ul>
+<li><strong>Horizontal assistants:</strong> ChatGPT (hundreds of millions of weekly users), Claude, Gemini, Meta AI, Microsoft Copilot, Grok, Perplexity.</li>
+<li><strong>Coding:</strong> the breakout category of 2025–26. Claude Code, OpenAI Codex, Cursor, GitHub Copilot, Windsurf/Cognition, Replit, Lovable, Bolt, v0. Several reached hundreds of millions to billions of dollars in annualised revenue within a year or two.</li>
+<li><strong>Vertical AI:</strong> Harvey (legal), Abridge and Ambience (clinical notes), Hebbia (finance), Sierra and Decagon (customer service), Glean (enterprise search).</li>
+<li><strong>Consumer media:</strong> image, video, voice and companion apps.</li>
+</ul>
+<h2>How money flows</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    U[&quot;Users and enterprises&quot;] --&gt;|&quot;subscriptions, API spend&quot;| APP[&quot;Apps&quot;]
+    APP --&gt;|&quot;API spend&quot;| LAB[&quot;Model labs&quot;]
+    U --&gt;|&quot;API spend&quot;| LAB
+    LAB --&gt;|&quot;compute contracts&quot;| CLOUD[&quot;Clouds and neoclouds&quot;]
+    CLOUD --&gt;|&quot;chip and system purchases&quot;| CHIP[&quot;NVIDIA, AMD, custom ASIC vendors&quot;]
+    CHIP --&gt;|&quot;wafers, HBM&quot;| FAB[&quot;TSMC, SK hynix, Samsung, Micron&quot;]
+    INV[&quot;Investors, sovereign funds, debt markets&quot;] --&gt;|&quot;equity and debt&quot;| LAB
+    INV --&gt;|&quot;project finance&quot;| CLOUD
+    CHIP -.-&gt;|&quot;strategic investments&quot;| LAB
+</pre>
+</figure>
+<h2>Roles in AI infrastructure (and what they do all day)</h2>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Day-to-day</th>
+<th>Core skills (chapters)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ML infrastructure / platform engineer</td>
+<td>Clusters, schedulers, training and serving platforms</td>
+<td>Kubernetes, Slurm, GPUs, networking (15, 17, 24)</td>
+</tr>
+<tr>
+<td>Inference / serving engineer</td>
+<td>Latency, throughput, cost per token</td>
+<td>vLLM/SGLang, quantization, batching, kernels (16, 19)</td>
+</tr>
+<tr>
+<td>Performance / kernel engineer</td>
+<td>Custom kernels, profiling, compiler work</td>
+<td>CUDA, Triton, CUTLASS, hardware (15, 16)</td>
+</tr>
+<tr>
+<td>Distributed training engineer</td>
+<td>Scaling, parallelism, reliability of big runs</td>
+<td>FSDP, Megatron, NCCL, checkpointing (17)</td>
+</tr>
+<tr>
+<td>RL / post-training infrastructure</td>
+<td>Rollout systems, environments, sandboxes</td>
+<td>Inference + training + distributed systems (12, 22)</td>
+</tr>
+<tr>
+<td>AI engineer / applied AI</td>
+<td>Building products on models</td>
+<td>RAG, agents, evals, gateways (20–23)</td>
+</tr>
+<tr>
+<td>Data engineer for AI</td>
+<td>Pretraining and fine-tuning data pipelines</td>
+<td>Spark/Ray, dedup, quality filtering (10)</td>
+</tr>
+<tr>
+<td>Data center / hardware engineer</td>
+<td>Power, cooling, rack integration</td>
+<td>Electrical, mechanical, networking (25)</td>
+</tr>
+</tbody>
+</table>
+<h2>Reading the industry critically</h2>
+<ul>
+<li><strong>Benchmarks in announcements</strong> are chosen by the announcer. Look for independent evaluations (Artificial Analysis, Epoch AI, LMArena, SWE-bench leaderboards, METR).</li>
+<li><strong>"Annualised revenue run-rate"</strong> is the latest month × 12; useful for fast-growing firms, but not the same as annual revenue.</li>
+<li><strong>Capex announcements</strong> often span many years and include options, not firm spending.</li>
+<li><strong>Price per token comparisons</strong> must account for tokenizer differences, cached-input discounts, reasoning tokens and output length.</li>
+</ul>
+<h2>Resources</h2>
+<ul>
+<li>Epoch AI (epoch.ai): data on compute, models, costs and trends.</li>
+<li>Artificial Analysis (artificialanalysis.ai): independent model and provider benchmarks for quality, speed and price.</li>
+<li>State of AI Report (Nathan Benaich, annual).</li>
+<li>Stanford HAI AI Index (annual).</li>
+<li>SemiAnalysis, Stratechery, and The Information for industry analysis (some paywalled).</li>
+<li>Podcasts: Dwarkesh Podcast, Latent Space, No Priors, Acquired's NVIDIA episodes.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>
