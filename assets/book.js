@@ -60,7 +60,8 @@
   // Deep dives live in deep-dives/ and hang off a parent chapter, e.g.
   // { parent: 15, file: "15a-gpu-architecture.html", title: "GPU Architecture and the Performance Model" }
   var DEEP_DIVES = [
-    { parent: 15, file: "15a-gpu-architecture.html", title: "GPU Architecture and the Performance Model" }
+    { parent: 15, file: "15a-gpu-architecture.html", title: "GPU Architecture and the Performance Model" },
+    { parent: 16, file: "16a-cuda-kernels.html", title: "CUDA Programming and Kernel Optimisation" }
   ];
   // ---- Pinned third-party libraries (loaded from jsDelivr) ---------------
   var HLJS_SRC = "https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js";

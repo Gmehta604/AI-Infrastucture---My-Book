@@ -1,0 +1,796 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CUDA Programming and Kernel Optimisation · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-deep="16a-cuda-kernels.html">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>CUDA Programming and Kernel Optimisation</h1>
+<p class="lede">This deep dive teaches you to write GPU kernels and, more importantly, to reason about why one kernel is fifty times faster than another that computes the same thing. We take a matrix multiply from a naive version to one that reaches most of cuBLAS's speed, one bottleneck at a time, then cover tensor cores, reductions, CUDA graphs, PyTorch integration, and the tools professionals use to debug and profile kernels.</p>
+
+<div class="meta-row"><span class="chip">~120 min read + lab time</span><span class="chip">Builds on Chapter 16 and Deep Dive 15a</span><span class="chip">Code: code/16a-cuda-kernels/</span></div>
+</header>
+
+<div class="objectives">
+<strong>You will be able to</strong>
+<ul>
+<li>Write, compile, launch and error-check CUDA kernels, and index threads correctly in 1D and 2D.</li>
+<li>Choose the right memory space (registers, shared, global, constant) and write coalesced accesses.</li>
+<li>Explain the compilation pipeline from C++ to PTX to SASS, and read register and spill reports.</li>
+<li>Optimise a matrix multiply through six stages, stating for each stage which bottleneck it removes.</li>
+<li>Recognise and fix shared-memory bank conflicts.</li>
+<li>Use tensor cores through WMMA, and explain what CUTLASS, cp.async, TMA and wgmma add.</li>
+<li>Write warp-level reductions and an online softmax kernel.</li>
+<li>Use streams and CUDA graphs to remove launch overhead.</li>
+<li>Call your own CUDA kernel from PyTorch.</li>
+<li>Debug with compute-sanitizer and diagnose performance with Nsight Compute.</li>
+</ul>
+</div>
+<h2>1. Why learn to write kernels?</h2>
+<p>Most engineers will call kernels far more often than they write them. Still, kernel knowledge pays off in three ways.</p>
+<ol>
+<li><strong>Reading performance correctly.</strong> Profiles are lists of kernels. Knowing what a kernel does internally tells you whether 30% of your step time in <code>elementwise_kernel</code> is a problem (usually yes) and how to fix it (usually fusion).</li>
+<li><strong>The highest-leverage work in the industry is kernel work.</strong> FlashAttention made long-context models practical. DeepSeek's open-sourced DeepGEMM (FP8 matmuls), FlashMLA (attention for its latent-attention architecture) and DeepEP (MoE communication) are a large part of why their models are cheap to train and serve. Each new GPU generation needs new kernels before its hardware features pay off.</li>
+<li><strong>Custom fusions for your model.</strong> When a production model has an unusual operation (a new activation, a custom attention mask, a quantization format), a fused kernel can cut its cost several times over.</li>
+</ol>
+<p>In practice today, you will write most custom kernels in <strong>Triton</strong> (Deep Dive 16b) and reach for <strong>CUDA C++</strong> or <strong>CUTLASS/CuTe</strong> when you need full control of the hardware. The concepts in this chapter apply to both.</p>
+<h2>2. The CUDA programming model in code</h2>
+<p>A CUDA program has two sides: <strong>host</strong> code that runs on the CPU and <strong>device</strong> code (kernels) that runs on the GPU. The host allocates GPU memory, copies data, launches kernels and copies results back.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    H1[&quot;Host: cudaMalloc device buffers&quot;] --&gt; H2[&quot;Host: cudaMemcpy host → device&quot;]
+    H2 --&gt; K[&quot;Launch kernel &lt;&lt;&lt;grid, block&gt;&gt;&gt;: thousands of threads run on the GPU&quot;]
+    K --&gt; H3[&quot;Host: cudaMemcpy device → host (waits for the kernel to finish)&quot;]
+    H3 --&gt; H4[&quot;Host: check errors, cudaFree&quot;]
+</pre>
+</figure>
+<p><span class="code-title">code/16a-cuda-kernels/vector_add.cu (core)</span></p>
+<pre><code class="language-cuda">__global__ void vector_add(const float* a, const float* b, float* c, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;   // this thread's global index
+  if (i &lt; n) c[i] = a[i] + b[i];                   // guard: the last block may overhang
+}
+
+// host side
+const int threads = 256;
+const int blocks = (n + threads - 1) / threads;    // enough blocks to cover n
+vector_add&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(da, db, dc, n);
+CUDA_CHECK(cudaGetLastError());                    // launch errors (bad config, etc.)
+CUDA_CHECK(cudaMemcpy(hc, dc, bytes, cudaMemcpyDeviceToHost));  // also surfaces runtime errors
+</code></pre>
+<p>Key facts:</p>
+<ul>
+<li><code>__global__</code> marks a kernel: called from the host, runs on the device. <code>__device__</code> functions are called from device code; <code>__host__ __device__</code> compiles for both.</li>
+<li><code>blockIdx</code>, <code>blockDim</code>, <code>threadIdx</code> and <code>gridDim</code> are built-in 3D coordinates. The global index formula above is the most common line in all of CUDA.</li>
+<li><strong>Always guard</strong> with <code>if (i &lt; n)</code>. The grid is rounded up to whole blocks, so the last block usually has threads past the end of the array.</li>
+<li><strong>Launches are asynchronous.</strong> <code>vector_add&lt;&lt;&lt;...&gt;&gt;&gt;</code> returns immediately. Errors inside the kernel appear at the next synchronising call. The <code>CUDA_CHECK</code> macro in <code>common.cuh</code> wraps every API call; skipping it is how people spend a day chasing "wrong results" that were actually an out-of-memory error.</li>
+</ul>
+<h3>Choosing block and grid sizes</h3>
+<ul>
+<li>Block size: a multiple of 32 (a warp). 128–512 threads is the usual range; 256 is a good default for simple kernels.</li>
+<li>Grid size: enough blocks to fill every SM several times over, so the scheduler can balance load and hide latency. For simple elementwise kernels, one thread per element is fine.</li>
+<li><strong>Grid-stride loops</strong> decouple the grid from the data size. A fixed number of threads (for example, 8 blocks per SM) walks the whole array, which works for any size and reduces per-block overhead:</li>
+</ul>
+<pre><code class="language-cuda">__global__ void vector_add_gridstride(const float* a, const float* b, float* c, int n) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i &lt; n; i += blockDim.x * gridDim.x)
+    c[i] = a[i] + b[i];
+}
+</code></pre>
+<p>Vector add reads 8 bytes and writes 4 bytes per FLOP. It is purely memory-bound (Deep Dive 15a), so its speed should approach your GPU's memory bandwidth. <code>./vector_add</code> prints the achieved GB/s; on an H100 expect roughly 2.8–3.1 TB/s.</p>
+<h3>2D indexing</h3>
+<p>For matrices, use a 2D grid and 2D blocks:</p>
+<pre><code class="language-cuda">dim3 block(16, 16);                                        // 256 threads
+dim3 grid((cols + 15) / 16, (rows + 15) / 16);
+kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(...);
+// inside the kernel
+int col = blockIdx.x * blockDim.x + threadIdx.x;           // x varies fastest → map it to columns
+int row = blockIdx.y * blockDim.y + threadIdx.y;
+</code></pre>
+<p>Map the <strong>fastest-varying thread index (x) to the contiguous dimension</strong> of your data (columns of a row-major matrix). Getting this backwards is the single most common cause of slow kernels, as kernel 1 below demonstrates.</p>
+<h2>3. Memory spaces</h2>
+<table>
+<thead>
+<tr>
+<th>Space</th>
+<th>Declared as</th>
+<th>Scope and lifetime</th>
+<th>Speed</th>
+<th>Typical use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Registers</td>
+<td>Local scalar variables, small fixed-size arrays with constant indexing</td>
+<td>One thread</td>
+<td>Fastest</td>
+<td>Accumulators, loop variables, register tiles</td>
+</tr>
+<tr>
+<td>Local memory</td>
+<td>Arrays indexed dynamically, register spills</td>
+<td>One thread, but physically in HBM (cached)</td>
+<td>Slow</td>
+<td>Avoid; watch for spills</td>
+</tr>
+<tr>
+<td>Shared memory</td>
+<td><code>__shared__</code></td>
+<td>One thread block</td>
+<td>~20–30 cycles</td>
+<td>Tiles reused by many threads, communication in a block</td>
+</tr>
+<tr>
+<td>Global memory</td>
+<td><code>cudaMalloc</code> pointers</td>
+<td>All threads, whole program</td>
+<td>Slowest on-chip-miss path</td>
+<td>All inputs and outputs</td>
+</tr>
+<tr>
+<td>Constant memory</td>
+<td><code>__constant__</code> (64 KB)</td>
+<td>All threads, read-only</td>
+<td>Fast when all threads read the same address</td>
+<td>Small parameters, lookup tables</td>
+</tr>
+</tbody>
+</table>
+<p>Practical rules:</p>
+<ul>
+<li>Mark pointers <code>const float* __restrict__</code> when they don't alias. It lets the compiler use the read-only cache and reorder loads.</li>
+<li>Keep per-thread arrays small and index them with compile-time constants (fully unrolled loops); otherwise they spill to local memory.</li>
+<li>Global memory accesses should be <strong>coalesced</strong> and <strong>aligned</strong>: a warp reading 32 consecutive 4-byte values issues one 128-byte request. Wider per-thread loads (<code>float4</code>, 16 bytes) reduce instruction count further.</li>
+<li><strong>Pinned (page-locked) host memory</strong> (<code>cudaMallocHost</code>) makes host-to-device copies faster and lets them run asynchronously. PyTorch's <code>DataLoader(pin_memory=True)</code> does exactly this.</li>
+</ul>
+<h2>4. How CUDA code is compiled</h2>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    SRC[&quot;kernel.cu (C++ with CUDA extensions)&quot;] --&gt; NVCC[&quot;nvcc front end&quot;]
+    NVCC --&gt; HOST[&quot;Host C++ → g++/clang → CPU code&quot;]
+    NVCC --&gt; PTX[&quot;PTX: virtual GPU assembly (portable across generations)&quot;]
+    PTX --&gt; PTXAS[&quot;ptxas: register allocation, scheduling&quot;]
+    PTXAS --&gt; SASS[&quot;SASS: real machine code for one architecture (sm_80, sm_90, ...)&quot;]
+    SASS --&gt; FAT[&quot;Fat binary: SASS for chosen archs + PTX for future JIT&quot;]
+    HOST --&gt; FAT
+</pre>
+</figure>
+<ul>
+<li><code>-arch=sm_90</code> compiles for H100. A binary containing PTX can be JIT-compiled by the driver for newer GPUs; one containing only SASS runs only on the architecture it was built for. Hopper-specific instructions such as <code>wgmma</code> require <code>sm_90a</code>, and Blackwell's need <code>sm_100a</code>.</li>
+<li><code>-lineinfo</code> keeps source line information for profilers without slowing the code.</li>
+<li><code>--ptxas-options=-v</code> prints registers, shared memory and spills per kernel. <strong>Read this output for every kernel you write.</strong></li>
+<li><code>cuobjdump -sass</code> and <code>nvdisasm</code> show the actual machine instructions. Advanced kernel engineers read SASS to confirm the compiler did what they intended (for example, that loads were vectorised).</li>
+</ul>
+<p>Here is the <code>ptxas</code> report for this chapter's matmul kernels, compiled for <code>sm_80</code> (exact numbers vary with compiler version):</p>
+<table>
+<thead>
+<tr>
+<th>Kernel</th>
+<th>Registers per thread</th>
+<th>Shared memory per block</th>
+<th>Spills</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 naive</td>
+<td>27</td>
+<td>0</td>
+<td>none</td>
+</tr>
+<tr>
+<td>2 coalesced</td>
+<td>29</td>
+<td>0</td>
+<td>none</td>
+</tr>
+<tr>
+<td>3 shared-memory tiling</td>
+<td>28</td>
+<td>8 KB</td>
+<td>none</td>
+</tr>
+<tr>
+<td>4 1D block tiling</td>
+<td>55</td>
+<td>4 KB</td>
+<td>none</td>
+</tr>
+<tr>
+<td>5 2D block tiling</td>
+<td>128</td>
+<td>8 KB</td>
+<td>none</td>
+</tr>
+<tr>
+<td>6 vectorised</td>
+<td>118</td>
+<td>8 KB</td>
+<td>none</td>
+</tr>
+</tbody>
+</table>
+<p>Kernels 5 and 6 use four times the registers of kernel 1. With 256 threads per block, that allows only two blocks (16 warps, 25% occupancy) per SM, yet they are by far the fastest. Recall the key idea from 15a: compute-bound kernels trade occupancy for register-level data reuse.</p>
+<div class="callout warn">
+<strong>Pitfall</strong>
+<p>Without <code>#pragma unroll</code> on the small inner loops, an early version of kernels 5 and 6 compiled with 256 bytes of stack per thread: the accumulator array had spilled to local memory. Adding the pragmas removed the spill. Always check the report after a change; a spill can silently halve performance.</p>
+</div>
+<h2>5. The matrix-multiply ladder</h2>
+<p>Matrix multiplication is the ideal teaching kernel: easy to write, extremely hard to make fast, and the operation that dominates AI compute. We compute <code>C = αAB + βC</code> for square FP32 matrices of size 4,096, stored row-major.</p>
+<div class="math">FLOPs              = 2 × 4096³ ≈ 137 GFLOP
+Minimum HBM traffic = read A + read B + write C = 3 × 64 MB = 192 MB
+Best-case intensity ≈ 716 FLOPs per byte  →  compute-bound on every GPU</div>
+
+<p>So a perfect kernel is limited by arithmetic throughput. Every stage below exists because the previous one moved far more than 192 MB, or kept the arithmetic units waiting.</p>
+<p>For reference, here is how a very similar sequence of kernels performed in Simon Boehm's well-known write-up, measured on an RTX A6000 in FP32. Your numbers will differ by GPU, but the shape of the progression is typical.</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Idea</th>
+<th>GFLOP/s</th>
+<th>% of cuBLAS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Naive</td>
+<td>309</td>
+<td>1.3%</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Global memory coalescing</td>
+<td>1,987</td>
+<td>8.5%</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Shared-memory tiling</td>
+<td>2,980</td>
+<td>12.8%</td>
+</tr>
+<tr>
+<td>4</td>
+<td>1D block tiling (several outputs per thread)</td>
+<td>8,475</td>
+<td>36.5%</td>
+</tr>
+<tr>
+<td>5</td>
+<td>2D block tiling (register outer product)</td>
+<td>15,972</td>
+<td>68.7%</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Vectorised memory access</td>
+<td>18,237</td>
+<td>78.4%</td>
+</tr>
+<tr>
+<td>(beyond)</td>
+<td>Autotuning, warp tiling</td>
+<td>21,779</td>
+<td>93.7%</td>
+</tr>
+<tr>
+<td>cuBLAS</td>
+<td></td>
+<td>23,250</td>
+<td>100%</td>
+</tr>
+</tbody>
+</table>
+<p><code>./sgemm</code> runs our six kernels on your GPU, checks each against cuBLAS for correctness, and prints the same table.</p>
+<h3>Kernel 1: naive</h3>
+<p>One thread per output element, looping over K.</p>
+<pre><code class="language-cuda">const int row = blockIdx.x * blockDim.x + threadIdx.x;
+const int col = blockIdx.y * blockDim.y + threadIdx.y;
+if (row &lt; M &amp;&amp; col &lt; N) {
+  float acc = 0.f;
+  for (int k = 0; k &lt; K; ++k) acc += A[row * K + k] * B[k * N + col];
+  C[row * N + col] = alpha * acc + beta * C[row * N + col];
+}
+</code></pre>
+<p><strong>Bottleneck: uncoalesced access.</strong> <code>threadIdx.x</code> varies fastest within a warp and we mapped it to <strong>rows</strong>. The 32 threads of a warp therefore read <code>A</code> from 32 different rows (addresses K floats apart) and write <code>C</code> to 32 different rows. Each access becomes its own memory transaction. There is also no data reuse: every thread reads a full row of A and column of B from global memory, so the kernel requests 2 × 4096³ × 4 bytes, about <strong>550 GB</strong>, for a 137-GFLOP job.</p>
+<h3>Kernel 2: global memory coalescing</h3>
+<p>Same algorithm; change only which thread computes which output.</p>
+<pre><code class="language-cuda">const int row = blockIdx.x * BS + threadIdx.x / BS;
+const int col = blockIdx.y * BS + threadIdx.x % BS;
+</code></pre>
+<p>Now the 32 threads of a warp share a row and cover 32 consecutive columns. Reads of <code>B[k*N + col]</code> touch 32 adjacent floats: one 128-byte transaction. Reads of <code>A[row*K + k]</code> are the same address for the whole warp, which the hardware broadcasts. Writes of <code>C</code> are coalesced.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    W1[&quot;Kernel 1: a warp spans 32 rows&quot;] --&gt; R1[&quot;Reads of B and writes of C: 32 separate transactions&quot;]
+    W2[&quot;Kernel 2: a warp spans 32 columns&quot;] --&gt; R2[&quot;Reads of B and writes of C: 1 transaction of 128 bytes&quot;]
+</pre>
+</figure>
+<p><strong>Speed-up: about 6×, from a two-line change.</strong> Remaining bottleneck: every thread still streams a full row of A and column of B through the memory system with no reuse.</p>
+<h3>Kernel 3: shared-memory tiling</h3>
+<p>Split the computation into tiles. Each 32×32 thread block computes a 32×32 tile of C. It walks along K in steps of 32: the block cooperatively loads a 32×32 tile of A and one of B into shared memory, synchronises, and every thread then computes 32 multiply-adds from the tiles.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    subgraph Loop[&quot;For each step along K (K/32 steps)&quot;]
+      direction TB
+      L1[&quot;All 1,024 threads load one element of the A tile and one of the B tile (coalesced)&quot;] --&gt; S1[&quot;__syncthreads(): tiles complete&quot;]
+      S1 --&gt; C1[&quot;Each thread: 32 FMAs reading As and Bs from shared memory&quot;]
+      C1 --&gt; S2[&quot;__syncthreads(): everyone done before tiles are overwritten&quot;]
+    end
+    Loop --&gt; W[&quot;Write the 32x32 C tile&quot;]
+</pre>
+</figure>
+<pre><code class="language-cuda">for (int bk = 0; bk &lt; K; bk += BS) {
+  As[tRow * BS + tCol] = A[tRow * K + tCol];      // coalesced: tCol is the fastest index
+  Bs[tRow * BS + tCol] = B[tRow * N + tCol];
+  __syncthreads();
+  A += BS;  B += BS * N;
+  for (int d = 0; d &lt; BS; ++d) acc += As[tRow * BS + d] * Bs[d * BS + tCol];
+  __syncthreads();
+}
+</code></pre>
+<p>Each element loaded from global memory is now reused 32 times, so global traffic falls by 32×. Both <code>__syncthreads()</code> calls are essential: remove the first and threads compute on half-loaded tiles; remove the second and fast threads overwrite a tile slower threads are still reading. (<code>compute-sanitizer --tool racecheck</code> catches the second bug.)</p>
+<p><strong>Bottleneck now: shared memory.</strong> The inner loop does 2 shared-memory loads for every FMA. Shared memory is fast, but not that fast: the load/store units saturate long before the FP32 units do. Nsight Compute reports this as high <strong>MIO throttle</strong> stalls (memory input/output queue full).</p>
+<h3>Kernel 4: 1D block tiling (more work per thread)</h3>
+<p>The fix for "too many loads per FMA" is to make each thread compute <strong>several</strong> outputs, so each loaded value is used more than once. In kernel 4, each thread computes a column of TM = 8 outputs. For each step d, it loads one value of B into a register and uses it 8 times.</p>
+<pre><code class="language-cuda">for (int d = 0; d &lt; BK; ++d) {
+  const float b = Bs[d * BN + tCol];                 // one shared-memory load...
+  for (int r = 0; r &lt; TM; ++r)
+    acc[r] += As[(tRow * TM + r) * BK + d] * b;      // ...used TM times
+}
+</code></pre>
+<p>Shared loads per FMA fall from 2 to (TM + 1) / TM ≈ 1.1. The block tile is 64×64 with BK = 8, and <code>acc[8]</code> lives in registers. <strong>Speed roughly triples.</strong></p>
+<h3>Kernel 5: 2D block tiling (register outer product)</h3>
+<p>Go further: each thread computes an 8×8 tile of outputs. For each step d it loads 8 values of A and 8 of B into registers and computes their <strong>outer product</strong>: 64 FMAs from 16 loads.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    RA[&quot;regM: 8 values from a column of the A tile&quot;] --&gt; OP[&quot;Outer product: 8 x 8 = 64 FMAs into 64 accumulator registers&quot;]
+    RB[&quot;regN: 8 values from a row of the B tile&quot;] --&gt; OP
+</pre>
+</figure>
+<pre><code class="language-cuda">for (int d = 0; d &lt; BK; ++d) {
+  for (int i = 0; i &lt; TM; ++i) regM[i] = As[(tRow * TM + i) * BK + d];
+  for (int i = 0; i &lt; TN; ++i) regN[i] = Bs[d * BN + tCol * TN + i];
+  for (int m = 0; m &lt; TM; ++m)
+    for (int n = 0; n &lt; TN; ++n) acc[m * TN + n] += regM[m] * regN[n];
+}
+</code></pre>
+<p>Shared loads per FMA: (8 + 8) / 64 = <strong>0.25</strong>, an 8× improvement over kernel 3. A 128×128 block tile is computed by 256 threads. The cost: 64 accumulators + 16 operands + indices ≈ 128 registers per thread, and 25% occupancy. <strong>Performance roughly doubles again</strong>, to around two-thirds of cuBLAS.</p>
+<div class="callout">
+<strong>Key idea</strong>
+<p>Every level of the memory hierarchy needs its own reuse. Tiling in shared memory reduces global-memory traffic; tiling in registers reduces shared-memory traffic. Fast GEMMs are nested tilings: grid → block tile (shared memory) → warp tile → thread tile (registers) → tensor-core fragment.</p>
+</div>
+<h3>Kernel 6: vectorised memory access</h3>
+<p>Two changes:</p>
+<ol>
+<li><strong>128-bit loads and stores.</strong> Load A and B from global memory as <code>float4</code>, and write C as <code>float4</code>. That's a quarter of the load instructions.</li>
+<li><strong>Transpose the A tile in shared memory.</strong> Kernel 5 reads <code>As[(tRow*TM + i)*BK + d]</code>, stepping by BK between consecutive i. Storing A transposed (<code>As[d*BM + row]</code>) makes the 8 values a thread needs contiguous, so the compiler can fetch them with wide 128-bit shared-memory loads.</li>
+</ol>
+<pre><code class="language-cuda">float4 a4 = reinterpret_cast&lt;const float4*&gt;(&amp;A[innerRowA * K + innerColA * 4])[0];
+As[(innerColA * 4 + 0) * BM + innerRowA] = a4.x;     // store transposed
+As[(innerColA * 4 + 1) * BM + innerRowA] = a4.y;
+As[(innerColA * 4 + 2) * BM + innerRowA] = a4.z;
+As[(innerColA * 4 + 3) * BM + innerRowA] = a4.w;
+reinterpret_cast&lt;float4*&gt;(&amp;Bs[innerRowB * BN + innerColB * 4])[0] =
+    reinterpret_cast&lt;const float4*&gt;(&amp;B[innerRowB * N + innerColB * 4])[0];
+</code></pre>
+<p><code>reinterpret_cast</code> to <code>float4</code> requires 16-byte alignment. <code>cudaMalloc</code> returns 256-byte-aligned pointers and our dimensions are multiples of 4, so every access is aligned. With arbitrary shapes you need a scalar fallback path, which is part of why production libraries are large.</p>
+<h3>What cuBLAS does beyond kernel 6</h3>
+<ul>
+<li><strong>Warp tiling:</strong> an explicit level between block and thread tiles, so each warp works on a sub-tile that fits its registers and reads shared memory without bank conflicts.</li>
+<li><strong>Double buffering / multi-stage pipelines:</strong> load the next K-tile while computing on the current one, so memory latency is hidden behind math (section 7).</li>
+<li><strong>Autotuning:</strong> dozens of tile-size configurations; the library picks per shape and GPU.</li>
+<li><strong>Tensor cores</strong> whenever precision allows (TF32 is the default for FP32 matmuls in many frameworks unless you disable it).</li>
+<li><strong>Special handling</strong> of edge tiles, split-K for skinny matrices, and stream-K scheduling against wave quantization (15a).</li>
+</ul>
+<h2>6. Shared-memory bank conflicts</h2>
+<p>Shared memory is divided into <strong>32 banks</strong>, each 4 bytes wide; consecutive 4-byte words sit in consecutive banks. Each bank serves one address per cycle. When threads of a warp access <strong>different addresses in the same bank</strong>, the accesses are serialised: an <em>n</em>-way bank conflict takes <em>n</em> times as long. Accessing the <strong>same address</strong> is a broadcast and is free.</p>
+<div class="math">bank(address) = (address in bytes ÷ 4) mod 32</div>
+
+<div class="worked">
+<strong>Worked example</strong>
+<p>A 32×32 float tile <code>tile[32][32]</code>, and each thread <code>t</code> of a warp reads <code>tile[t][0]</code> (a column).</p>
+<div class="math">word index of tile[t][0] = 32 × t   →   bank = (32 × t) mod 32 = 0 for every t
+→ 32-way conflict: 32 cycles instead of 1</div>
+<p><strong>Fix: padding.</strong> Declare <code>tile[32][33]</code>. Now the word index is 33 × t, and <code>33t mod 32 = t</code>, so every thread hits a different bank. One wasted column eliminates the conflict. This is the standard trick for matrix transposes.</p>
+</div>
+<p>Modern libraries use <strong>swizzling</strong> instead of padding: they XOR the column index with part of the row index when storing, so both row and column accesses are conflict-free with no wasted memory. CuTe (inside CUTLASS) and Triton handle swizzled layouts automatically. Nsight Compute's "Shared Memory" table reports bank conflicts per kernel, so measure rather than guess.</p>
+<h2>7. Tensor cores from CUDA</h2>
+<p>FP32 CUDA cores deliver a small fraction of a modern GPU's FLOPs (15a). Real AI kernels use tensor cores. There are several levels of access, from easiest to most powerful.</p>
+<h3>Level 1: the WMMA API (Volta and later)</h3>
+<p>WMMA ("warp matrix multiply-accumulate") exposes tensor cores through <strong>fragments</strong>: opaque register tiles owned collectively by a warp.</p>
+<p><span class="code-title">code/16a-cuda-kernels/hgemm_wmma.cu (core)</span></p>
+<pre><code class="language-cuda">#include &lt;mma.h&gt;
+using namespace nvcuda;
+
+wmma::fragment&lt;wmma::matrix_a, 16, 16, 16, half, wmma::row_major&gt; a;
+wmma::fragment&lt;wmma::matrix_b, 16, 16, 16, half, wmma::row_major&gt; b;
+wmma::fragment&lt;wmma::accumulator, 16, 16, 16, float&gt; acc;
+wmma::fill_fragment(acc, 0.f);
+
+for (int k = 0; k &lt; K; k += 16) {
+  wmma::load_matrix_sync(a, A + row * K + k, K);   // whole warp loads a 16x16 tile
+  wmma::load_matrix_sync(b, B + k * N + col, N);
+  wmma::mma_sync(acc, a, b, acc);                  // one tensor-core operation
+}
+wmma::store_matrix_sync(C + row * N + col, acc, N, wmma::mem_row_major);
+</code></pre>
+<p>Each warp computes one 16×16 output tile with FP16 inputs and FP32 accumulation. This simple version loads fragments directly from global memory with no shared-memory staging, so it reaches only a fraction of cuBLAS. Even so, it typically <strong>beats the best FP32 kernel from section 5</strong>, because tensor cores are so much faster. Run <code>./hgemm_wmma 4096</code> to see both numbers.</p>
+<h3>Level 2: <code>mma.sync</code>, <code>ldmatrix</code> and <code>cp.async</code> (Ampere)</h3>
+<p>Serious Ampere kernels use PTX instructions directly:</p>
+<ul>
+<li><code>mma.sync.aligned.m16n8k16</code>: the underlying tensor-core instruction, with known register layouts.</li>
+<li><code>ldmatrix</code>: loads fragments from shared memory in exactly the layout <code>mma</code> needs.</li>
+<li><code>cp.async</code>: copies from global to shared memory <strong>without passing through registers</strong>, asynchronously. That enables multi-stage <strong>software pipelines</strong>:</li>
+</ul>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    subgraph T0[&quot;Time step t&quot;]
+      A0[&quot;cp.async: load K-tile t+2 into buffer 3&quot;]
+      B0[&quot;Tensor cores: compute on K-tile t (buffer 1)&quot;]
+    end
+    subgraph T1[&quot;Time step t+1&quot;]
+      A1[&quot;cp.async: load K-tile t+3 into buffer 1&quot;]
+      B1[&quot;Tensor cores: compute on K-tile t+1 (buffer 2)&quot;]
+    end
+    T0 --&gt; T1
+</pre>
+</figure>
+<p>With 3–4 stages in flight, memory latency is fully hidden behind math.</p>
+<h3>Level 3: Hopper's TMA, wgmma and warp specialisation</h3>
+<p>On H100, the fastest kernels are structured very differently:</p>
+<ul>
+<li><strong>TMA (tensor memory accelerator):</strong> one thread issues a bulk copy of a whole multi-dimensional tile from global to shared memory; the hardware computes addresses. Arrival is tracked with <strong>mbarriers</strong> (asynchronous barriers).</li>
+<li><strong><code>wgmma</code>:</strong> a <em>warpgroup</em> (4 warps, 128 threads) issues one large asynchronous MMA that reads its operands directly from shared memory.</li>
+<li><strong>Warp specialisation:</strong> some warps act as <strong>producers</strong> (issuing TMA loads) and others as <strong>consumers</strong> (issuing wgmma), coordinating through barriers in a circular buffer of shared-memory stages. FlashAttention-3 and DeepGEMM are built this way.</li>
+<li><strong>Thread block clusters</strong> let neighbouring blocks share tiles via distributed shared memory, and <strong>multicast</strong> TMA loads a tile once into several SMs.</li>
+</ul>
+<h3>Level 4: Blackwell's tcgen05 and tensor memory</h3>
+<p>Blackwell moves MMA accumulators out of registers into <strong>tensor memory (TMEM)</strong>, a dedicated per-SM store, and lets a pair of SMs cooperate on one MMA (<code>cta_group::2</code>). It adds block-scaled FP8/FP6/FP4 formats in hardware. Kernels written for Hopper need restructuring to use these; this is why each GPU generation has a lag before software reaches its peak.</p>
+<h3>Libraries you will actually use</h3>
+<table>
+<thead>
+<tr>
+<th>Library</th>
+<th>What it is</th>
+<th>When to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>cuBLAS / cuBLASLt</strong></td>
+<td>NVIDIA's GEMM library; cuBLASLt adds epilogue fusion (bias, activation) and FP8</td>
+<td>Default for matmuls</td>
+</tr>
+<tr>
+<td><strong>CUTLASS / CuTe</strong></td>
+<td>C++ templates (and the CuTe DSL in Python) exposing every level of the GEMM hierarchy</td>
+<td>Custom GEMMs, fused epilogues, new data types</td>
+</tr>
+<tr>
+<td><strong>DeepGEMM</strong> (DeepSeek)</td>
+<td>Compact, readable FP8 GEMM kernels for Hopper/Blackwell</td>
+<td>Study material; FP8 MoE GEMMs</td>
+</tr>
+<tr>
+<td><strong>ThunderKittens</strong> (Stanford)</td>
+<td>A small tile-based library for fast attention and GEMM kernels</td>
+<td>Research, readable Hopper kernels</td>
+</tr>
+<tr>
+<td><strong>Triton</strong></td>
+<td>Python tile language compiled to GPU code</td>
+<td>Most custom fusions (16b)</td>
+</tr>
+</tbody>
+</table>
+<h2>8. Warp-level programming: reductions and softmax</h2>
+<p>Many AI operations reduce along a dimension: sums for normalisation, max and sum for softmax, norms for gradient clipping. They are memory-bound, so the goal is to read each byte once at full bandwidth.</p>
+<h3>Warp shuffles</h3>
+<p>Threads in a warp can read each other's registers directly with <strong>shuffle</strong> instructions, without shared memory or synchronisation:</p>
+<pre><code class="language-cuda">__inline__ __device__ float warp_sum(float v) {
+  for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1)
+    v += __shfl_down_sync(0xffffffff, v, offset);   // add the value from lane (id + offset)
+  return v;                                         // lane 0 now holds the warp's total
+}
+</code></pre>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    S0[&quot;32 values&quot;] --&gt;|&quot;offset 16&quot;| S1[&quot;16 partial sums&quot;]
+    S1 --&gt;|&quot;offset 8&quot;| S2[&quot;8&quot;]
+    S2 --&gt;|&quot;offset 4&quot;| S3[&quot;4&quot;]
+    S3 --&gt;|&quot;offset 2&quot;| S4[&quot;2&quot;]
+    S4 --&gt;|&quot;offset 1&quot;| S5[&quot;1 total in lane 0&quot;]
+</pre>
+</figure>
+<p><code>reduction.cu</code> compares three strategies for summing 64 million floats:</p>
+<ol>
+<li><strong>One <code>atomicAdd</code> per element:</strong> every thread updates the same address; the hardware serialises them. Catastrophically slow.</li>
+<li><strong>Shared-memory tree per block, one atomic per block:</strong> fast, but many blocks and synchronisations.</li>
+<li><strong>Grid-stride with <code>float4</code> loads, warp shuffles, one atomic per warp:</strong> each thread first sums many elements in registers, then the warp combines them. This approaches peak memory bandwidth.</li>
+</ol>
+<h3>Online softmax: one pass instead of three</h3>
+<p>A textbook softmax reads each row three times: find the max, sum the exponentials, normalise. The <strong>online softmax</strong> trick (Milakov and Gimelshein, 2018) computes the max and the sum together in one pass, rescaling the running sum whenever a new maximum appears:</p>
+<div class="math">for each element v:
+    m_new = max(m, v)
+    s     = s · exp(m − m_new) + exp(v − m_new)
+    m     = m_new</div>
+
+<p>Two partial results (m₁, s₁) and (m₂, s₂) combine the same way, so the 32 lanes of a warp can each process a strided part of the row and then merge with shuffles:</p>
+<pre><code class="language-cuda">for (int off = 16; off &gt; 0; off &gt;&gt;= 1) {
+  float m_o = __shfl_xor_sync(0xffffffff, m, off);
+  float s_o = __shfl_xor_sync(0xffffffff, s, off);
+  float m_new = fmaxf(m, m_o);
+  s = s * expf(m - m_new) + s_o * expf(m_o - m_new);
+  m = m_new;
+}
+</code></pre>
+<p>This is exactly the insight inside FlashAttention (Chapter 16 and 16b): softmax can be computed block by block without ever holding the whole row.</p>
+<p><code>softmax.cu</code> compares a naive thread-per-row kernel (uncoalesced, and only <code>rows</code> threads in total) with the warp-per-row online kernel. The difference on an 8192×4096 matrix is typically more than an order of magnitude.</p>
+<h2>9. Streams, concurrency and CUDA graphs</h2>
+<p>A <strong>stream</strong> is a queue of GPU work that runs in order. Work in different streams may overlap. The default stream is used when you don't specify one.</p>
+<p>Uses of multiple streams:</p>
+<ul>
+<li><strong>Overlap copies with compute:</strong> copy batch <em>i+1</em> to the GPU (with pinned memory and <code>cudaMemcpyAsync</code>) while computing batch <em>i</em>.</li>
+<li><strong>Overlap communication with compute:</strong> NCCL collectives run on their own streams; distributed training overlaps gradient all-reduce with the backward pass (Deep Dive 17b).</li>
+<li><strong>Run independent small kernels concurrently</strong> so they share the GPU.</li>
+</ul>
+<h3>Launch overhead and CUDA graphs</h3>
+<p>Each kernel launch costs a few microseconds of CPU and driver time. For a big matmul that's negligible. For LLM <strong>decode</strong> it is not: one decode step of a Transformer is hundreds of small kernels, each running for only a few microseconds at small batch sizes. The CPU can't launch them fast enough, and the GPU idles between them.</p>
+<p>A <strong>CUDA graph</strong> records a sequence of launches once and replays the whole sequence with a single call:</p>
+<pre><code class="language-cuda">cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+for (int i = 0; i &lt; 2000; ++i) tiny&lt;&lt;&lt;1, 32, 0, stream&gt;&gt;&gt;(d);   // recorded, not run
+cudaStreamEndCapture(stream, &amp;graph);
+cudaGraphInstantiate(&amp;exec, graph, 0);
+cudaGraphLaunch(exec, stream);                                    // replays all 2,000
+</code></pre>
+<p><code>./cuda_graphs</code> measures the difference on your GPU. Serving engines such as vLLM and SGLang capture the decode step as a CUDA graph for each common batch size; in PyTorch, <code>torch.compile(mode="reduce-overhead")</code> and <code>torch.cuda.CUDAGraph</code> do the same. The constraint: graphs replay fixed shapes and fixed memory addresses, which is why engines keep static buffers and pad batches to a set of captured sizes.</p>
+<h2>10. Calling your kernel from PyTorch</h2>
+<p>The quickest route is <code>torch.utils.cpp_extension.load_inline</code>, which compiles CUDA source at runtime and exposes it as a Python function.</p>
+<p><span class="code-title">code/16a-cuda-kernels/fused_bias_gelu.py (core)</span></p>
+<pre><code class="language-python">cuda_src = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+
+__global__ void bias_gelu_kernel(const float* __restrict__ x, const float* __restrict__ bias,
+                                 float* __restrict__ y, long n, int cols) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i &lt; n) {
+    float v = x[i] + bias[i % cols];
+    y[i] = 0.5f * v * (1.f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+  }
+}
+
+torch::Tensor bias_gelu(torch::Tensor x, torch::Tensor bias) {
+  auto y = torch::empty_like(x);
+  long n = x.numel();
+  auto stream = at::cuda::getCurrentCUDAStream();     // run on PyTorch's current stream
+  bias_gelu_kernel&lt;&lt;&lt;(n + 255) / 256, 256, 0, stream&gt;&gt;&gt;(
+      x.data_ptr&lt;float&gt;(), bias.data_ptr&lt;float&gt;(), y.data_ptr&lt;float&gt;(), n, x.size(-1));
+  return y;
+}
+&quot;&quot;&quot;
+ext = load_inline(name=&quot;bias_gelu_ext&quot;, cpp_sources=&quot;torch::Tensor bias_gelu(torch::Tensor x, torch::Tensor bias);&quot;,
+                  cuda_sources=cuda_src, functions=[&quot;bias_gelu&quot;], extra_cuda_cflags=[&quot;-O3&quot;])
+y = ext.bias_gelu(x, b)
+</code></pre>
+<p>The full script validates inputs with <code>TORCH_CHECK</code>, compares against PyTorch, and benchmarks three versions: eager PyTorch (an add kernel then a GELU kernel, so two round trips to memory), <code>torch.compile</code> (which generates a fused Triton kernel automatically), and the custom kernel. Expect the custom kernel and <code>torch.compile</code> to be similar and both faster than eager. That result is itself a lesson: <strong>try <code>torch.compile</code> before writing CUDA</strong>.</p>
+<p>For production, register kernels as proper PyTorch operators with <code>torch.library</code> (so they work with <code>torch.compile</code>, autograd and export), write a backward kernel or an autograd formula, and build them ahead of time with <code>setup.py</code> / <code>CUDAExtension</code> rather than at runtime.</p>
+<h2>11. Debugging and profiling</h2>
+<h3>Correctness tools</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Finds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>compute-sanitizer --tool memcheck</code></td>
+<td>Out-of-bounds and misaligned global/shared accesses, invalid frees</td>
+</tr>
+<tr>
+<td><code>compute-sanitizer --tool racecheck</code></td>
+<td>Shared-memory data races (usually a missing <code>__syncthreads()</code>)</td>
+</tr>
+<tr>
+<td><code>compute-sanitizer --tool synccheck</code></td>
+<td>Invalid use of synchronisation, e.g. <code>__syncthreads()</code> inside a divergent branch</td>
+</tr>
+<tr>
+<td><code>compute-sanitizer --tool initcheck</code></td>
+<td>Reads of uninitialised global memory</td>
+</tr>
+<tr>
+<td><code>cuda-gdb</code></td>
+<td>Step through device code, inspect per-thread variables</td>
+</tr>
+<tr>
+<td><code>printf</code> in kernels</td>
+<td>Quick checks; guard with <code>if (threadIdx.x == 0 &amp;&amp; blockIdx.x == 0)</code></td>
+</tr>
+</tbody>
+</table>
+<p>Always test kernels on awkward sizes (1, 31, 33, 1000, primes) and compare with a trusted reference (NumPy, cuBLAS, PyTorch), using tolerances appropriate for the precision.</p>
+<h3>Nsight Compute: what the numbers mean</h3>
+<p><code>ncu --set full -k regex:sgemm_2d -o k5 ./sgemm 5 4096</code> produces a detailed report for one kernel. The sections that matter most:</p>
+<table>
+<thead>
+<tr>
+<th>Section / metric</th>
+<th>Question it answers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>GPU Speed of Light</strong></td>
+<td>What % of peak compute and peak memory bandwidth did the kernel reach? The higher one is your limiter.</td>
+</tr>
+<tr>
+<td><strong>Memory Workload Analysis</strong></td>
+<td>Bytes moved at each level (L1, L2, DRAM), hit rates, shared-memory bank conflicts</td>
+</tr>
+<tr>
+<td><strong>Occupancy</strong></td>
+<td>Theoretical vs achieved occupancy, and which resource limits it</td>
+</tr>
+<tr>
+<td><strong>Warp State Statistics</strong></td>
+<td>Why warps were stalled (see below)</td>
+</tr>
+<tr>
+<td><strong>Source Counters</strong></td>
+<td>Which source lines (with <code>-lineinfo</code>) cause the stalls</td>
+</tr>
+</tbody>
+</table>
+<p>The most common <strong>warp stall reasons</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>Stall</th>
+<th>Meaning</th>
+<th>Typical fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Long scoreboard</td>
+<td>Waiting for global/local memory</td>
+<td>More reuse (tiling), more parallelism, prefetching, fix spills</td>
+</tr>
+<tr>
+<td>MIO throttle / short scoreboard</td>
+<td>Shared-memory or special-function queue saturated</td>
+<td>Register tiling, vectorised shared loads, fewer bank conflicts</td>
+</tr>
+<tr>
+<td>Barrier</td>
+<td>Waiting at <code>__syncthreads()</code></td>
+<td>Balance work, fewer barriers, double buffering</td>
+</tr>
+<tr>
+<td>Math pipe throttle</td>
+<td>Arithmetic units busy</td>
+<td>Good: you're compute-bound; use tensor cores or lower precision</td>
+</tr>
+<tr>
+<td>Not selected / selected</td>
+<td>Warps ready but only one issues per cycle</td>
+<td>Good sign of a saturated scheduler</td>
+</tr>
+</tbody>
+</table>
+<h3>A performance checklist</h3>
+<ol>
+<li>Is the kernel memory-bound or compute-bound? (Roofline, 15a.)</li>
+<li>Are global accesses coalesced and vectorised?</li>
+<li>Is every level of the hierarchy reusing data (shared-memory tiles, register tiles)?</li>
+<li>Any register spills? Any bank conflicts?</li>
+<li>Is there enough parallelism (blocks per SM, waves) for the problem size?</li>
+<li>Is the computation on tensor cores in the lowest acceptable precision?</li>
+<li>Can this kernel be fused with its neighbours to skip a round trip to memory?</li>
+<li>Is launch overhead significant (many tiny kernels)? Use CUDA graphs.</li>
+</ol>
+<h2>Exercises</h2>
+<div class="exercises">
+<div class="exercise">
+<p>A kernel is launched with <code>&lt;&lt;&lt;(n + 127) / 128, 128&gt;&gt;&gt;</code> for n = 1,000,000. How many threads run, and how many do nothing?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>7,813 blocks × 128 = 1,000,064 threads; 64 fail the <code>i &lt; n</code> guard and do nothing.</p>
+</details>
+</div>
+<div class="exercise">
+<p>In kernel 1, a warp's 32 threads read <code>A[row * K + k]</code> with <code>row</code> varying across the warp. With K = 4096 and FP32, how far apart are consecutive threads' addresses, and roughly how many 32-byte sectors does one warp-wide load touch?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>4,096 × 4 bytes = 16 KB apart; every thread hits a different sector, so 32 sectors (1,024 bytes fetched to use 128 bytes).</p>
+</details>
+</div>
+<div class="exercise">
+<p>Kernel 3 uses 32×32 tiles. By what factor does it reduce global-memory loads compared with kernel 2, ignoring caches? What does the inner loop's ratio of shared-memory loads to FMAs become?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>Each loaded element is reused by 32 threads, so global loads fall ~32×. The inner loop still does 2 shared loads per FMA, which becomes the new bottleneck.</p>
+</details>
+</div>
+<div class="exercise">
+<p>In kernel 5 with TM = TN = 8, how many shared-memory loads and FMAs happen per thread per step <code>d</code>? What happens to the ratio with TM = TN = 16, and why might that be slower anyway?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>16 loads, 64 FMAs (ratio 0.25). With 16×16: 32 loads, 256 FMAs (0.125). But 256 accumulators exceed the 255-register limit, causing spills to local memory and a large slowdown, and occupancy would collapse.</p>
+</details>
+</div>
+<div class="exercise">
+<p>A block reads a column of <code>__shared__ float t[64][64]</code>: thread i reads <code>t[i][5]</code> for i in 0..31. What is the bank conflict degree? How would you fix it?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>Word index = 64i + 5 → bank (64i + 5) mod 32 = 5 for all i: a 32-way conflict. Pad to <code>t[64][65]</code>: bank (65i + 5) mod 32 = (i + 5) mod 32, all distinct. Or use a swizzled layout.</p>
+</details>
+</div>
+<div class="exercise">
+<p>Show that two online-softmax partial states (m₁, s₁) and (m₂, s₂) combine into (m, s) = (max(m₁, m₂), s₁·e^(m₁−m) + s₂·e^(m₂−m)), where s is the sum of e^(x−m) over both halves.</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>By definition s₁ = Σ₁ e^(x−m₁). Multiplying by e^(m₁−m) gives Σ₁ e^(x−m). Similarly for the second half. Adding them gives Σ over all elements of e^(x−m), with m the true maximum, so every exponent is ≤ 0 and nothing overflows.</p>
+</details>
+</div>
+<div class="exercise">
+<p>A decode step at batch size 1 consists of 600 kernels averaging 4 µs of GPU time each, and each launch costs 5 µs of CPU time. Estimate the step time without and with a CUDA graph.</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>Without: the CPU is the bottleneck, ~600 × 5 µs = 3.0 ms (the GPU idles ~20% of the time). With a graph: close to 600 × 4 µs = 2.4 ms plus a single launch. A 20% speed-up; larger when kernels are shorter.</p>
+</details>
+</div>
+<div class="exercise">
+<p>Nsight Compute shows a kernel at 85% of peak DRAM bandwidth and 6% of peak compute, with "long scoreboard" as the top stall. Is it worth optimising further? What would you try?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>It is memory-bound and already near the bandwidth roofline, so tuning this kernel alone has at most ~15% left. The real gains come from moving fewer bytes: fuse it with neighbouring operations, use a lower-precision data type, or avoid materialising its output.</p>
+</details>
+</div>
+</div>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project: Fuse a production hotspot</h3>
+<p><strong>Business problem:</strong> a team serving a fine-tuned model sees that 25% of GPU time goes to "elementwise" and "reduction" kernels between the matmuls. They want a measured, safe speed-up without changing model quality.</p>
+<ol>
+<li><strong>Profile.</strong> Run a real model (e.g., a 1B–8B Hugging Face model) for a forward pass under the PyTorch profiler or Nsight Systems. Rank kernels by total time and identify a chain of memory-bound ops (for example RMSNorm → multiply by weight → residual add, or bias → activation → dropout).</li>
+<li><strong>Estimate the prize.</strong> Compute the bytes each op moves and the bytes a fused version would move. The ratio bounds your speed-up for that chain.</li>
+<li><strong>Implement.</strong> Write a fused CUDA kernel (using this chapter's patterns: coalesced <code>float4</code> loads, warp-shuffle reductions) and, for comparison, the same fusion via <code>torch.compile</code>.</li>
+<li><strong>Integrate and verify.</strong> Register the kernel with <code>torch.library</code>, run the model with it, and check outputs match to within tolerance across a validation set.</li>
+<li><strong>Report.</strong> End-to-end latency and throughput before and after, per-kernel Nsight Compute speed-of-light numbers, and a recommendation on whether to maintain a custom kernel or rely on the compiler.</li>
+</ol>
+</div>
+<h2>Further reading</h2>
+<ul>
+<li>NVIDIA, <em>CUDA C++ Programming Guide</em> and <em>CUDA C++ Best Practices Guide</em> (docs.nvidia.com/cuda).</li>
+<li>Simon Boehm, <em>How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog</em> (2022). The inspiration for section 5; read it alongside the code.</li>
+<li>Hwu, Kirk and El Hajj, <em>Programming Massively Parallel Processors</em>, 4th edition (2022).</li>
+<li>Mark Harris, <em>Optimizing Parallel Reduction in CUDA</em> (NVIDIA slides), and NVIDIA's blog posts on warp shuffles and cooperative groups.</li>
+<li>Milakov and Gimelshein, <em>Online normalizer calculation for softmax</em> (2018).</li>
+<li>NVIDIA CUTLASS documentation and the CuTe tutorials; the <em>Hopper Tuning Guide</em> and <em>Blackwell Tuning Guide</em>.</li>
+<li>Colfax Research tutorials on Hopper GEMMs with TMA and wgmma, and on FlashAttention-3.</li>
+<li>DeepSeek's DeepGEMM and FlashMLA repositories; Stanford's ThunderKittens.</li>
+<li>The <strong>GPU MODE</strong> lecture series (YouTube) and its community.</li>
+<li>NVIDIA, <em>Nsight Compute Kernel Profiling Guide</em> (the reference for every metric above).</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>
