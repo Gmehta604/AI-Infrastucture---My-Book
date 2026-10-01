@@ -1,0 +1,739 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Numerics: BF16, FP8 and FP4 · Gradient to Gigawatt</title>
+  <link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-deep="16c-numerics.html">
+<article class="chapter">
+
+<header class="chap-head">
+<h1>Numerics: BF16, FP8 and FP4</h1>
+<p class="lede">Halving the bits per number is the cheapest speed-up in AI: half the memory, half the bandwidth, and on tensor cores roughly twice the FLOP/s. Every generation of hardware has pushed lower, from FP32 to BF16 to FP8 to FP4. This deep dive explains how these formats work bit by bit, what breaks when you shrink them, and the scaling and accumulation tricks that let frontier models train in FP8 and serve in FP4.</p>
+
+<div class="meta-row"><span class="chip">~100 min read</span><span class="chip">Builds on Chapter 2 and Deep Dives 15a–16b</span><span class="chip">Code: code/16c-numerics/ (all CPU)</span></div>
+</header>
+
+<div class="objectives">
+<strong>You will be able to</strong>
+<ul>
+<li>Decode any floating-point number from its sign, exponent and mantissa bits, including subnormals.</li>
+<li>Compare FP32, TF32, BF16, FP16, FP8 (E4M3, E5M2), FP6, FP4 and integer formats on range and precision.</li>
+<li>Explain the four ways low precision breaks: overflow, underflow, swamping and outliers.</li>
+<li>Describe mixed-precision training, including why FP16 needs loss scaling and BF16 doesn't.</li>
+<li>Choose a scaling granularity (per-tensor, per-channel, per-block, microscaling) and justify it.</li>
+<li>Explain how DeepSeek-V3 trained in FP8, and what NVFP4 and MXFP4 change for Blackwell-era inference and training.</li>
+<li>Pick a weight-quantization scheme for serving and estimate its memory saving.</li>
+<li>Debug NaNs and loss spikes, and explain why LLM inference is often not bit-for-bit deterministic.</li>
+</ul>
+</div>
+<h2>1. Why precision is the cheapest speed-up</h2>
+<p>Every byte saved per number pays off three times:</p>
+<table>
+<thead>
+<tr>
+<th>Benefit</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Memory capacity</strong></td>
+<td>A 70B model needs 140 GB in BF16, 70 GB in FP8, ~37 GB in 4-bit: fewer GPUs, bigger batches, longer contexts</td>
+</tr>
+<tr>
+<td><strong>Memory bandwidth</strong></td>
+<td>Memory-bound work (decode, normalisations, optimizer steps) speeds up nearly in proportion to bytes saved</td>
+</tr>
+<tr>
+<td><strong>Compute</strong></td>
+<td>Tensor cores roughly double their FLOP/s each time the input width halves</td>
+</tr>
+</tbody>
+</table>
+<p>H100 dense tensor-core throughput illustrates the third point: TF32 ~495 TFLOP/s, BF16 ~989, FP8 ~1,979. Blackwell adds FP4 at roughly double FP8 again, and Rubin's vendor figures lean even harder on NVFP4 (Deep Dive 15a).</p>
+<p>The catch is that fewer bits mean less <strong>range</strong> (how large and small a number can be) and less <strong>precision</strong> (how finely numbers are spaced). The rest of this chapter is about spending bits where they matter.</p>
+<h2>2. Floating point from the bits up</h2>
+<p>A floating-point number has three fields:</p>
+<div class="math">value = (−1)^sign × 1.mantissa × 2^(exponent − bias)        (normal numbers)
+value = (−1)^sign × 0.mantissa × 2^(1 − bias)              (subnormals: exponent field = 0)</div>
+
+<ul>
+<li>The <strong>sign</strong> bit is 0 for positive, 1 for negative.</li>
+<li>The <strong>exponent</strong> field (e bits) sets the scale. It is stored with a <strong>bias</strong> of 2^(e−1) − 1 so that negative exponents can be represented: for BF16 and FP32 (8 exponent bits) the bias is 127.</li>
+<li>The <strong>mantissa</strong> (or significand) field (m bits) holds the fraction after an implicit leading 1. It sets the precision: there are 2^m evenly spaced values between each pair of powers of two.</li>
+</ul>
+<div class="worked">
+<strong>Worked example</strong>
+<p>How is 0.1 stored in BF16? Running <code>python float_formats.py</code> prints the bits:</p>
+<div class="math">FP32: 0 01111011 10011001100110011001101   = 0.1000000015
+BF16: 0 01111011 1001100                    = 0.1000976562</div>
+<p>The exponent field 01111011 is 123; 123 − 127 = −4, so the scale is 2⁻⁴ = 0.0625. The BF16 mantissa 1001100 is 76/128 = 0.59375, so the value is 1.59375 × 0.0625 = 0.0996… before rounding. BF16 rounds to the nearest representable value, giving 1.6015625 × 0.0625 = 0.1000977. <strong>BF16 is literally the top 16 bits of FP32</strong> (with rounding), which is why converting between them is cheap and why BF16 has exactly FP32's range.</p>
+</div>
+<h3>Precision: machine epsilon and ULPs</h3>
+<p><strong>Machine epsilon</strong> is the gap between 1 and the next representable number: 2⁻ᵐ. For BF16 (m = 7) it is 2⁻⁷ ≈ 0.0078, about two significant decimal digits. A <strong>ULP</strong> (unit in the last place) is the gap at any given magnitude; it doubles with each power of two. Relative precision is roughly constant across the range, which is what makes floating point suit neural networks, whose values span many orders of magnitude.</p>
+<h3>Special values</h3>
+<ul>
+<li><strong>Zero</strong> has exponent and mantissa fields of zero (and there is a −0).</li>
+<li><strong>Subnormals</strong> (exponent field 0) fill the gap between zero and the smallest normal number, with gradually decreasing precision.</li>
+<li><strong>Infinity</strong> and <strong>NaN</strong> use the all-ones exponent in IEEE formats (FP32, FP16, BF16, E5M2).</li>
+<li><strong>FP8 E4M3</strong> (the "fn" variant used by NVIDIA and in PyTorch's <code>float8_e4m3fn</code>) gives up infinity to gain range: only the bit pattern S.1111.111 is NaN, so its largest value is 1.75 × 2⁸ = <strong>448</strong>. AMD's MI300 series used slightly different "fnuz" variants (no negative zero, different bias); newer AMD parts support the OCP standard formats.</li>
+</ul>
+<h3>Rounding</h3>
+<p>Hardware rounds to the <strong>nearest</strong> representable value, with ties to the one whose last bit is even (<strong>round-to-nearest-even</strong>). Its errors are unbiased on average but can systematically lose tiny updates (section 4). <strong>Stochastic rounding</strong> rounds up or down at random with probability proportional to distance; its expected value equals the true value. Some low-precision training methods and hardware support it.</p>
+<h2>3. The format zoo</h2>
+<p><code>python float_formats.py</code> computes this table from the definitions:</p>
+<table>
+<thead>
+<tr>
+<th>Format</th>
+<th>Bits (sign/exp/mantissa)</th>
+<th>Max value</th>
+<th>Smallest normal</th>
+<th>Epsilon</th>
+<th>~Decimal digits</th>
+<th>Typical use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32</td>
+<td>1/8/23</td>
+<td>3.4 × 10³⁸</td>
+<td>1.2 × 10⁻³⁸</td>
+<td>1.2 × 10⁻⁷</td>
+<td>6.9</td>
+<td>Master weights, optimizer state, accumulators</td>
+</tr>
+<tr>
+<td>TF32</td>
+<td>1/8/10 (in 32-bit storage)</td>
+<td>3.4 × 10³⁸</td>
+<td>1.2 × 10⁻³⁸</td>
+<td>9.8 × 10⁻⁴</td>
+<td>3.0</td>
+<td>FP32 matmuls on tensor cores (opt-in in PyTorch)</td>
+</tr>
+<tr>
+<td>BF16</td>
+<td>1/8/7</td>
+<td>3.4 × 10³⁸</td>
+<td>1.2 × 10⁻³⁸</td>
+<td>7.8 × 10⁻³</td>
+<td>2.1</td>
+<td>Default training and serving format</td>
+</tr>
+<tr>
+<td>FP16</td>
+<td>1/5/10</td>
+<td>65,504</td>
+<td>6.1 × 10⁻⁵</td>
+<td>9.8 × 10⁻⁴</td>
+<td>3.0</td>
+<td>Older mixed precision; some inference</td>
+</tr>
+<tr>
+<td>FP8 E5M2</td>
+<td>1/5/2</td>
+<td>57,344</td>
+<td>6.1 × 10⁻⁵</td>
+<td>0.25</td>
+<td>0.6</td>
+<td>Gradients in early FP8 recipes</td>
+</tr>
+<tr>
+<td>FP8 E4M3</td>
+<td>1/4/3</td>
+<td>448</td>
+<td>0.0156</td>
+<td>0.125</td>
+<td>0.9</td>
+<td>FP8 training and inference</td>
+</tr>
+<tr>
+<td>FP6 E3M2 / E2M3</td>
+<td>1/3/2, 1/2/3</td>
+<td>28 / 7.5</td>
+<td>0.25 / 1</td>
+<td>0.25 / 0.125</td>
+<td>~0.6–0.9</td>
+<td>Blackwell MX formats</td>
+</tr>
+<tr>
+<td>FP4 E2M1</td>
+<td>1/2/1</td>
+<td>6</td>
+<td>1</td>
+<td>0.5</td>
+<td>0.3</td>
+<td>MXFP4 / NVFP4 weights and activations</td>
+</tr>
+<tr>
+<td>INT8</td>
+<td>8-bit integer</td>
+<td>127</td>
+<td>–</td>
+<td>uniform</td>
+<td>–</td>
+<td>Weight and activation quantization</td>
+</tr>
+<tr>
+<td>INT4 / NF4</td>
+<td>4-bit integer or codebook</td>
+<td>7 / 1</td>
+<td>–</td>
+<td>uniform / non-uniform</td>
+<td>–</td>
+<td>Weight-only quantization</td>
+</tr>
+</tbody>
+</table>
+<p>Two things stand out. First, <strong>BF16 traded precision for range</strong>: it has FP32's exponent and only 7 mantissa bits, so it almost never overflows or underflows, but it is coarse. FP16 is the opposite: three times the precision but a maximum of 65,504 and a smallest normal of 6 × 10⁻⁵. Deep learning turned out to care much more about range, which is why BF16 won.</p>
+<p>Second, <strong>FP4 can only represent 15 values</strong>: ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}. Everything about FP4 is in how you scale data into that tiny set.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    A[&quot;FP32: 8 exp + 23 mantissa&quot;] --&gt;|&quot;drop 16 mantissa bits&quot;| B[&quot;BF16: same range, ~2 digits&quot;]
+    A --&gt;|&quot;shrink exponent to 5&quot;| C[&quot;FP16: small range, ~3 digits&quot;]
+    B --&gt;|&quot;4-bit exp, 3-bit mantissa, no inf&quot;| D[&quot;FP8 E4M3: max 448, ~1 digit&quot;]
+    D --&gt;|&quot;2-bit exp, 1-bit mantissa&quot;| E[&quot;FP4 E2M1: 15 values, needs per-block scales&quot;]
+</pre>
+</figure>
+<h2>4. How low precision breaks</h2>
+<p>There are four failure modes. Recognising them is most of the skill.</p>
+<h3>1. Overflow</h3>
+<p>Values above the maximum become infinity (or NaN in E4M3). Typical culprits: attention logits, exponentials in softmax, sums of squares in normalisation layers, and gradient norms. FP16 overflows at 65,504; E4M3 at 448. Fixes: compute these operations in FP32, subtract the max before exponentiating, scale before casting, and <strong>saturate</strong> (clamp to the format's maximum) rather than produce infinity.</p>
+<h3>2. Underflow</h3>
+<p>Values below the smallest subnormal become zero. Gradients are the classic victim: with FP16, many gradient values in deep networks fall below 6 × 10⁻⁸ and vanish. <code>python mixed_precision_training.py</code> shows it directly: with a small loss, <strong>100% of FP16 gradients become exactly zero</strong> and the loss never moves, while BF16 and FP16-with-loss-scaling track FP32 exactly:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Loss after epoch 1</th>
+<th>After epoch 8</th>
+<th>Gradients exactly zero</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32</td>
+<td>0.353</td>
+<td>0.133</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>BF16 autocast</td>
+<td>0.353</td>
+<td>0.133</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>FP16, no scaling</td>
+<td>0.922</td>
+<td>0.922</td>
+<td><strong>100%</strong></td>
+</tr>
+<tr>
+<td>FP16 + GradScaler</td>
+<td>0.353</td>
+<td>0.133</td>
+<td>0.2%</td>
+</tr>
+</tbody>
+</table>
+<h3>3. Swamping (lost additions)</h3>
+<p>Adding a small number to a large one in low precision can do nothing at all: if the small number is less than half a ULP of the large one, the sum rounds back to the large one. From <code>python accumulation.py</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Summing 20,000 × 0.01 (true answer 200)</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32 accumulator</td>
+<td>199.97</td>
+</tr>
+<tr>
+<td>FP16 accumulator</td>
+<td>32.0</td>
+</tr>
+<tr>
+<td>BF16 accumulator</td>
+<td><strong>4.0</strong></td>
+</tr>
+<tr>
+<td>BF16 + Kahan compensated summation</td>
+<td>197.0</td>
+</tr>
+<tr>
+<td>BF16 + stochastic rounding</td>
+<td>201.0</td>
+</tr>
+</tbody>
+</table>
+<p>The BF16 sum stops growing at 4.0 because BF16's spacing near 4 is 2⁻⁵ = 0.03125, and 0.01 is less than half of that. This is why <strong>every tensor-core matmul accumulates in FP32</strong> even when its inputs are BF16 or FP8: a dot product of length 4,096 accumulated in BF16 had 13× the error of the same dot product accumulated in FP32 (6.7 × 10⁻² vs 5.0 × 10⁻³) in the same script.</p>
+<p>The same effect hits <strong>weight updates</strong>. A BF16 weight of 1.0 cannot change by less than about 0.002: an update of 10⁻³ leaves it exactly at 1.0. With learning rates around 10⁻⁴ and small gradients, most updates would vanish. Hence <strong>FP32 master weights</strong>: the optimizer updates an FP32 copy, and BF16 is produced from it for the forward and backward passes.</p>
+<h3>4. Outliers</h3>
+<p>LLM activations are not well-behaved Gaussians. A few channels carry values tens to hundreds of times larger than the rest ("massive activations" or "outlier features"; Dettmers et al. found they emerge systematically in models above roughly 6.7B parameters). With integer formats, or any format with few values like FP4, a single scale per tensor must cover the outliers, leaving ordinary values crushed into a handful of levels. Section 6 shows the fix: finer-grained scales.</p>
+<div class="callout">
+<strong>Key idea</strong>
+<p>Low-precision recipes follow one pattern: store and multiply in the narrow format, <strong>accumulate in FP32</strong>, keep <strong>numerically sensitive operations</strong> (softmax, normalisation statistics, loss, optimizer state, master weights) in higher precision, and <strong>scale</strong> tensors into the narrow format's range at a granularity fine enough to handle outliers.</p>
+</div>
+<h2>5. Mixed-precision training</h2>
+<p>The standard recipe (Micikevicius et al., 2017), adapted for BF16:</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    MW[&quot;FP32 master weights&quot;] --&gt;|&quot;cast&quot;| W16[&quot;BF16 weights&quot;]
+    W16 --&gt; FWD[&quot;Forward pass: BF16 matmuls, FP32 accumulation; softmax, norms, loss in FP32&quot;]
+    FWD --&gt; BWD[&quot;Backward pass: BF16 gradients&quot;]
+    BWD --&gt;|&quot;(FP16 only) unscale, check for inf/NaN&quot;| G32[&quot;Gradients in FP32&quot;]
+    G32 --&gt; OPT[&quot;AdamW in FP32: update master weights, m and v&quot;]
+    OPT --&gt; MW
+</pre>
+</figure>
+<p>In PyTorch, <code>torch.autocast</code> chooses the precision per operation: matmuls and convolutions run in BF16/FP16; reductions, softmax, normalisation, losses and pointwise ops that are sensitive to precision stay in FP32.</p>
+<pre><code class="language-python">model = model.cuda()                       # parameters stay FP32 (the master copy)
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+# BF16: no loss scaling needed
+for x, y in loader:
+    with torch.autocast(&quot;cuda&quot;, dtype=torch.bfloat16):
+        loss = loss_fn(model(x), y)
+    loss.backward()
+    opt.step(); opt.zero_grad(set_to_none=True)
+
+# FP16: dynamic loss scaling
+scaler = torch.amp.GradScaler(&quot;cuda&quot;)
+for x, y in loader:
+    with torch.autocast(&quot;cuda&quot;, dtype=torch.float16):
+        loss = loss_fn(model(x), y)
+    scaler.scale(loss).backward()          # multiply loss by S (e.g. 65,536) so gradients don't underflow
+    scaler.step(opt)                       # unscale; skip the step if any gradient is inf/NaN
+    scaler.update()                        # lower S after overflow, raise it after a run of good steps
+</code></pre>
+<p><strong>Dynamic loss scaling</strong> multiplies the loss by a large factor S before backward, which shifts every gradient up by S (the chain rule is linear) and out of the underflow zone. Before the optimizer step, gradients are divided by S. If any gradient overflowed to infinity, the step is skipped and S is halved; after a run of good steps, S is doubled. BF16's range makes all of this unnecessary, which is a large part of why it replaced FP16.</p>
+<p>Memory for training with this recipe is the <strong>16 bytes per parameter</strong> from Chapter 5: 2 (BF16 weights) + 2 (BF16 gradients) + 4 (FP32 master) + 4 + 4 (Adam m and v). Reducing it further means storing optimizer state in lower precision (8-bit Adam, BF16 moments as in DeepSeek-V3) or sharding it (Deep Dive 17b).</p>
+<div class="callout warn">
+<strong>Pitfall</strong>
+<p>TF32 is not enabled for matmuls by default in PyTorch, so a model written in FP32 runs its matmuls on slow paths unless you call <code>torch.set_float32_matmul_precision("high")</code>. Conversely, if you need exact FP32 results (for numerical tests), make sure TF32 is off. Many "my model is slow" and "my test fails on A100 but not on CPU" reports are this setting.</p>
+</div>
+<h2>6. Scaling: fitting tensors into narrow formats</h2>
+<p>FP8 and FP4 cannot represent typical tensors directly: E4M3's maximum is 448 and FP4's is 6. Before casting, multiply by a <strong>scale</strong> so the tensor's largest magnitude (its <strong>amax</strong>) maps near the format's maximum; afterwards, the matmul result is multiplied by the inverse scales.</p>
+<div class="math">scale  = amax(X) / format_max
+X_q    = cast(X / scale)                       stored in FP8 / FP4
+A·B   ≈ (A_q · B_q) × scale_A × scale_B        accumulated in FP32</div>
+
+<p>The question is <strong>how many values share one scale</strong>.</p>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart TD
+    G[&quot;Scaling granularity: one scale per...&quot;] --&gt; T[&quot;Tensor: cheapest; one outlier sets the scale for everything&quot;]
+    G --&gt; R[&quot;Row / channel / token: handles per-token or per-channel outliers&quot;]
+    G --&gt; B[&quot;Block (e.g. 1x128 or 128x128 tiles): DeepSeek-V3 FP8 training&quot;]
+    G --&gt; M[&quot;Micro-block (16-32 values): MXFP8 / MXFP4 / NVFP4, supported in Blackwell hardware&quot;]
+</pre>
+</figure>
+<p><code>python scaling.py</code> quantizes an activation-like tensor (256 tokens × 4,096 channels with 8 large outlier channels) every way and reports the relative error:</p>
+<table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>Bits per value incl. scales</th>
+<th>Relative error</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP8 E4M3, per-tensor</td>
+<td>~8</td>
+<td>0.027</td>
+</tr>
+<tr>
+<td>FP8 E4M3, per-row</td>
+<td>~8</td>
+<td>0.021</td>
+</tr>
+<tr>
+<td>FP8 E4M3, 1×128 tiles (DeepSeek-V3)</td>
+<td>~8.06</td>
+<td>0.012</td>
+</tr>
+<tr>
+<td>MXFP8 (blocks of 32, power-of-two scale)</td>
+<td>8.25</td>
+<td>0.026</td>
+</tr>
+<tr>
+<td>FP4, per-tensor</td>
+<td>~4</td>
+<td>0.440</td>
+</tr>
+<tr>
+<td>FP4, per-row</td>
+<td>~4</td>
+<td>0.374</td>
+</tr>
+<tr>
+<td>MXFP4 (blocks of 32, power-of-two scale)</td>
+<td>4.25</td>
+<td>0.123</td>
+</tr>
+<tr>
+<td>NVFP4 (blocks of 16, FP8 scale)</td>
+<td>4.5</td>
+<td>0.065</td>
+</tr>
+</tbody>
+</table>
+<p>Two lessons:</p>
+<ol>
+<li><strong>FP8 is fairly forgiving</strong> because it is still a floating-point format: each value keeps about the same relative precision wherever it sits in the range, so ordinary channels lose little even when an outlier sets a per-tensor scale. Finer tiles still halve the error.</li>
+<li><strong>FP4 is not forgiving.</strong> With 15 values, a per-tensor scale destroys the tensor (44% error). Small blocks with their own scale are essential, and NVFP4's smaller blocks and more precise FP8 scales (instead of MXFP4's power-of-two scales) cut the error roughly in half again for a quarter of a bit more per value.</li>
+</ol>
+<h3>Delayed vs current scaling</h3>
+<p>Computing amax requires a pass over the tensor before the cast. <strong>Current (just-in-time) scaling</strong> computes it right away, which costs an extra read but is exact. <strong>Delayed scaling</strong>, used by early versions of NVIDIA's Transformer Engine, uses the maximum of amax values recorded over recent steps, so the scale is known before the tensor is produced and the cast can be fused into the producing kernel. It is cheaper but can be wrong when values jump suddenly, causing overflow and saturation. Fine-grained schemes compute the scale for each small block on the fly inside the kernel, which makes the problem disappear.</p>
+<h3>Microscaling (MX) and NVFP4</h3>
+<p>The <strong>OCP Microscaling (MX) specification</strong> (2023, backed by AMD, Arm, Intel, Meta, Microsoft, NVIDIA and Qualcomm) defines formats where each block of 32 elements shares one 8-bit power-of-two scale (E8M0): MXFP8, MXFP6, MXFP4 and MXINT8. <strong>NVFP4</strong> is NVIDIA's variant: blocks of 16 FP4 values, each with an FP8 E4M3 scale, plus one FP32 scale per tensor. Blackwell tensor cores apply these block scales in hardware during the matmul, so fine-grained scaling costs almost nothing in speed.</p>
+<h2>7. FP8 and FP4 training in practice</h2>
+<h3>The first FP8 recipes</h3>
+<p>Micikevicius et al. (2022) proposed <strong>E4M3 for weights and activations</strong> (more precision) and <strong>E5M2 for gradients</strong> (more range), with per-tensor delayed scaling. NVIDIA's Transformer Engine implemented this for Hopper and it was used for many FP8 training runs.</p>
+<h3>DeepSeek-V3's recipe (2024)</h3>
+<p>DeepSeek trained a 671B-parameter MoE model mostly in FP8 and published the details. The key choices:</p>
+<ul>
+<li><strong>E4M3 for all FP8 tensors</strong>, including gradients, made possible by fine-grained scaling: <strong>1×128 tiles</strong> for activations (per token, per 128 channels) and <strong>128×128 blocks</strong> for weights.</li>
+<li><strong>Higher-precision accumulation.</strong> They found that Hopper's FP8 tensor cores accumulate with limited precision (around 14 bits), which hurts long dot products. Their kernels periodically move partial sums into FP32 registers on the regular CUDA cores, every 128 elements along K. <code>fp8_matmul.py</code> simulates this pattern.</li>
+<li><strong>Keep sensitive parts in BF16/FP32:</strong> the embedding, the output head, MoE gating, normalisation and attention operations, as well as master weights, weight gradients and optimizer states (the Adam moments in BF16).</li>
+<li><strong>Result:</strong> they reported the loss of the FP8 model stayed within 0.25% of a BF16 baseline.</li>
+</ul>
+<figure class="diagram">
+<pre class="mermaid">
+flowchart LR
+    X[&quot;Activation (BF16)&quot;] --&gt;|&quot;1x128 tile scales&quot;| XQ[&quot;FP8 E4M3&quot;]
+    W[&quot;FP32 master weight&quot;] --&gt;|&quot;128x128 block scales&quot;| WQ[&quot;FP8 E4M3&quot;]
+    XQ --&gt; MM[&quot;FP8 tensor-core MMA&quot;]
+    WQ --&gt; MM
+    MM --&gt;|&quot;every 128 elements of K&quot;| ACC[&quot;Promote partial sum to FP32, apply scales&quot;]
+    ACC --&gt; Y[&quot;Output (BF16)&quot;]
+</pre>
+</figure>
+<p>FP8 training is now common in frontier pretraining and supported in open frameworks: Transformer Engine, <code>torchao.float8</code> (with FSDP2 integration), Megatron, and DeepSeek's open-source DeepGEMM kernels.</p>
+<h3>FP4 training</h3>
+<p>Training directly in FP4 is the 2025–26 frontier. Blackwell supports MXFP4 and NVFP4 matmuls in hardware, and NVIDIA has reported pretraining multi-billion-parameter models on trillions of tokens with NVFP4, using techniques such as stochastic rounding of gradients, random Hadamard transforms to spread outliers across a block, and keeping a small fraction of sensitive layers in higher precision. Treat FP4 training as research-grade: promising, hardware-specific, and still evolving.</p>
+<h2>8. Quantization for inference</h2>
+<p>Serving is where low precision is most widely used, because inference is memory-bound (15a) and has no gradients to protect. Deep Dive 19b covers the algorithms in depth; here are the numerical foundations.</p>
+<h3>Weight-only vs weight-and-activation</h3>
+<table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>Weights</th>
+<th>Activations</th>
+<th>Speed-up comes from</th>
+<th>Common methods</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>W4A16 / W8A16</strong></td>
+<td>4 or 8 bits</td>
+<td>BF16/FP16</td>
+<td>Fewer bytes per decode step (memory-bound)</td>
+<td>GPTQ, AWQ, bitsandbytes NF4</td>
+</tr>
+<tr>
+<td><strong>W8A8 (INT8)</strong></td>
+<td>INT8</td>
+<td>INT8</td>
+<td>INT8 tensor cores + fewer bytes</td>
+<td>SmoothQuant</td>
+</tr>
+<tr>
+<td><strong>W8A8 (FP8)</strong></td>
+<td>FP8</td>
+<td>FP8</td>
+<td>FP8 tensor cores; near-lossless for most models</td>
+<td>Per-channel / per-token scales; the default for large-model serving on Hopper+</td>
+</tr>
+<tr>
+<td><strong>W4A4 (NVFP4 / MXFP4)</strong></td>
+<td>FP4</td>
+<td>FP4</td>
+<td>FP4 tensor cores on Blackwell</td>
+<td>Block scaling; often with calibration or quantization-aware training</td>
+</tr>
+<tr>
+<td><strong>KV cache FP8 / INT4</strong></td>
+<td>–</td>
+<td>KV cache</td>
+<td>More concurrent sequences and longer contexts</td>
+<td>Per-head or per-token scales</td>
+</tr>
+</tbody>
+</table>
+<p>OpenAI's gpt-oss models (2025) shipped with their MoE weights natively in MXFP4, so the 120B model fits on a single 80 GB GPU.</p>
+<h3>Group-wise quantization</h3>
+<p>Integer weight quantization uses the same idea as block scaling: a scale (and sometimes a zero-point) per group of 64 or 128 weights along the input dimension. <code>python weight_quantization.py</code> compares schemes on a 2,048 × 4,096 weight matrix with rare large values, measuring the error of the layer's <strong>output</strong> for realistic inputs:</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Bits per weight</th>
+<th>Output error</th>
+<th>Memory for a 70B model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>INT8 per-tensor</td>
+<td>8.0</td>
+<td>0.067</td>
+<td>70 GB</td>
+</tr>
+<tr>
+<td>INT8 per-channel</td>
+<td>8.0</td>
+<td>0.027</td>
+<td>70 GB</td>
+</tr>
+<tr>
+<td>FP8 E4M3 per-channel</td>
+<td>8.0</td>
+<td>0.026</td>
+<td>70 GB</td>
+</tr>
+<tr>
+<td>INT4 per-channel</td>
+<td>4.0</td>
+<td>0.476</td>
+<td>35 GB</td>
+</tr>
+<tr>
+<td>INT4 group-128 symmetric</td>
+<td>4.12</td>
+<td>0.153</td>
+<td>36 GB</td>
+</tr>
+<tr>
+<td>INT4 group-128 asymmetric (zero-point)</td>
+<td>4.25</td>
+<td>0.114</td>
+<td>37 GB</td>
+</tr>
+<tr>
+<td>NF4 group-64 (QLoRA)</td>
+<td>4.25</td>
+<td>0.100</td>
+<td>37 GB</td>
+</tr>
+<tr>
+<td>FP4 blocks of 16, FP8 scale</td>
+<td>4.5</td>
+<td>0.103</td>
+<td>39 GB</td>
+</tr>
+</tbody>
+</table>
+<p>A fraction of a bit per weight spent on group scales cuts 4-bit error by 3–4×. <strong>NF4</strong> (from QLoRA) uses 16 levels placed at the quantiles of a normal distribution instead of evenly spaced ones, matching how weights are actually distributed. Calibration-based methods (GPTQ, AWQ) reduce output error further by adjusting weights or scales using sample inputs.</p>
+<h3>PTQ vs QAT</h3>
+<p><strong>Post-training quantization (PTQ)</strong> quantizes a finished model, sometimes with a small calibration set. <strong>Quantization-aware training (QAT)</strong> simulates quantization during training or fine-tuning (with a straight-through estimator for gradients) so the model learns to tolerate it. At 8 bits PTQ is usually enough; at 4 bits and below, QAT or careful calibration often makes the difference, and several labs now release QAT checkpoints for 4-bit deployment.</p>
+<div class="callout warn">
+<strong>Pitfall</strong>
+<p>Average benchmark scores can hide quantization damage. Long-context retrieval, math, code and non-English text are often the first to degrade. Always evaluate quantized models on your own tasks and on long inputs before shipping (Deep Dive 23a).</p>
+</div>
+<h2>9. Hardware support</h2>
+<table>
+<thead>
+<tr>
+<th>Hardware</th>
+<th>TF32</th>
+<th>BF16</th>
+<th>FP16</th>
+<th>FP8</th>
+<th>FP6 / FP4 / MX block scaling</th>
+<th>INT8</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NVIDIA A100 (Ampere)</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>–</td>
+<td>–</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>NVIDIA L4 / L40S (Ada)</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>–</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>NVIDIA H100 / H200 (Hopper)</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓ (per-tensor scales; finer scales in software)</td>
+<td>–</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>NVIDIA B200 / B300 (Blackwell)</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓ (+ MXFP8)</td>
+<td>✓ MXFP6/MXFP4/NVFP4 in hardware</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>AMD MI300X</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓ (FNUZ variants)</td>
+<td>–</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>AMD MI355X</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓ (OCP)</td>
+<td>✓ MXFP6/MXFP4</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>Google TPU v5p / v6e</td>
+<td>–</td>
+<td>✓</td>
+<td>–</td>
+<td>– / limited</td>
+<td>–</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>Google TPU v7 Ironwood</td>
+<td>–</td>
+<td>✓</td>
+<td>–</td>
+<td>✓</td>
+<td>–</td>
+<td>✓</td>
+</tr>
+</tbody>
+</table>
+<p>Check the current datasheets: support details (and the speed of each path) change with every generation and software release.</p>
+<h2>10. Debugging numerics</h2>
+<h3>NaN and infinity hunting</h3>
+<ol>
+<li><strong>Find the first bad step.</strong> Log loss, gradient norm and the max absolute value of activations per layer. NaNs usually appear after a spike.</li>
+<li><strong>Find the first bad op.</strong> <code>torch.autograd.set_detect_anomaly(True)</code> reports the backward op that produced a NaN (slow; use on one batch). Forward hooks that check <code>torch.isfinite</code> on each module's output locate forward problems.</li>
+<li><strong>Usual suspects:</strong> division by a value that underflowed to zero, <code>log(0)</code>, <code>sqrt</code> of a tiny negative from rounding, softmax without max-subtraction, FP16 overflow in attention logits, a learning rate that is too high, and corrupted data.</li>
+<li><strong>Fixes:</strong> compute the operation in FP32, add an epsilon, clamp, use the numerically stable form (<code>logsumexp</code>, <code>log_softmax</code>), lower the learning rate, or add QK-norm or logit soft-capping for attention.</li>
+</ol>
+<h3>Loss spikes in large runs</h3>
+<p>Large runs occasionally spike even in BF16. Monitoring amax statistics of activations and gradients over time (which FP8 training needs anyway) gives early warning. Common mitigations: gradient clipping, QK-norm, lower learning rate for embeddings, skipping the offending batch and rolling back to a checkpoint (Chapter 10).</p>
+<h3>Determinism and batch invariance</h3>
+<p>Floating-point addition is <strong>not associative</strong>: (a + b) + c can differ from a + (b + c). GPU kernels split reductions differently depending on the number of threads, the order atomic operations complete in, and, importantly for serving, the <strong>batch size</strong>. So the same prompt can produce slightly different logits, and eventually different tokens, depending on what else was in the batch. Thinking Machines Lab's 2025 write-up <em>Defeating Nondeterminism in LLM Inference</em> showed that making kernels <strong>batch-invariant</strong> (fixing the reduction order regardless of batch size) gives bitwise-reproducible outputs at a modest speed cost. This matters for RL training (where the sampler and trainer must agree on probabilities) and for debugging and evaluation.</p>
+<pre><code class="language-python">torch.use_deterministic_algorithms(True)       # error on known non-deterministic ops
+torch.backends.cudnn.benchmark = False
+# plus: fixed seeds, fixed batch composition, and batch-invariant kernels for serving
+</code></pre>
+<h2>Exercises</h2>
+<div class="exercises">
+<div class="exercise">
+<p>Decode the FP8 E4M3 bit pattern <code>0 1010 011</code>. (Bias is 7.)</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>Exponent 1010 = 10, so 2^(10 − 7) = 8. Mantissa 011 = 3/8, so the value is 1.375 × 8 = <strong>11.0</strong>.</p>
+</details>
+</div>
+<div class="exercise">
+<p>What is the spacing between adjacent BF16 numbers in [256, 512)? What happens if you add 1.0 to a BF16 value of 300?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>256 = 2⁸, and with 7 mantissa bits the spacing is 2^(8 − 7) = 2. Adding 1 to 300 gives 301, which is exactly halfway between 300 and 302; round-to-nearest-even keeps 300 (mantissa ending in 0). The addition is lost.</p>
+</details>
+</div>
+<div class="exercise">
+<p>Why does FP16 training need loss scaling while BF16 training doesn't, even though FP16 has more precision?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>FP16's smallest subnormal is about 6 × 10⁻⁸, so small gradients underflow to zero. BF16 has FP32's 8-bit exponent and can represent values down to about 10⁻⁴⁰, so gradients practically never underflow. Range matters more than precision for gradients.</p>
+</details>
+</div>
+<div class="exercise">
+<p>A tensor's amax is 1,200. What per-tensor scale maps it onto FP8 E4M3, and what is the largest error, relative to the value, for a value of 1,000 after quantization?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>scale = 1,200 / 448 ≈ 2.68. 1,000 / 2.68 ≈ 373.3, which lies in [256, 512) where E4M3 spacing is 32. It rounds to 384, which dequantizes to about 1,029: a 2.9% error. The worst case in that range is half the spacing, 16 / 256 ≈ 6.25% relative.</p>
+</details>
+</div>
+<div class="exercise">
+<p>How many bits per value does NVFP4 cost, counting the block scale but ignoring the per-tensor scale? How much memory do the weights of a 405B model need in NVFP4?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>4 + 8/16 = 4.5 bits. 405 × 10⁹ × 4.5 / 8 ≈ 228 GB.</p>
+</details>
+</div>
+<div class="exercise">
+<p>DeepSeek-V3 promotes FP8 partial sums to FP32 every 128 elements of K. Why not just accumulate everything in the tensor core?</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>They measured that Hopper's FP8 tensor cores keep only about 14 bits of precision in the accumulator. For long inner dimensions (K in the thousands), the accumulated rounding error becomes significant (the swamping effect). Periodically adding partial results into true FP32 registers bounds the error, at a small cost because the transfer overlaps with other work.</p>
+</details>
+</div>
+<div class="exercise">
+<p>Your RL training job uses vLLM to sample and PyTorch to compute log-probabilities, and the two disagree slightly even with identical weights. Give two possible numerical causes.</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>Different kernels with different reduction orders (non-associative floating-point sums); batch-size-dependent reductions in the serving engine (lack of batch invariance); different precisions (e.g. FP8 KV cache or quantized weights in the sampler but BF16 in the trainer); different attention implementations or fused operations.</p>
+</details>
+</div>
+<div class="exercise">
+<p>A W4A16 model serves faster than the BF16 model at batch size 1 but no faster at batch size 256. Explain why.</p>
+<details class="answer">
+<summary>Show answer</summary>
+<p>At batch 1, decode is weight-bandwidth-bound, so reading 4× fewer bytes per step speeds it up. At batch 256, the matmuls approach compute-bound territory and still run in BF16 (weights are dequantized before the multiply), so fewer weight bytes no longer help, and dequantization adds work. W4A4 or FP8 W8A8, which use low-precision tensor cores, help at high batch sizes.</p>
+</details>
+</div>
+</div>
+<div class="build">
+<strong>Build it</strong>
+<h3>Project: Should we switch our fine-tuning to FP8?</h3>
+<p><strong>Business problem:</strong> an ML team fine-tunes 8B models weekly on rented H100s. A vendor claims FP8 will cut their GPU bill by 30–40%. Leadership wants evidence before changing a production pipeline.</p>
+<ol>
+<li><strong>Baseline.</strong> Fine-tune a 1B–8B model in BF16 with FSDP2 on one 8×H100 node (or a single H100 with a smaller model). Record tokens/s, peak memory, and the training and validation loss curves.</li>
+<li><strong>FP8.</strong> Repeat with <code>torchao.float8</code> (or Transformer Engine) using tensor-wise and then row-wise or block-wise scaling. Keep the embedding and output head in BF16.</li>
+<li><strong>Compare quality.</strong> Overlay the loss curves, and evaluate both final models on the same task benchmark plus a long-context check. Quantify the difference.</li>
+<li><strong>Find the edge cases.</strong> Log per-layer amax over training. Which layers have the largest dynamic range? Do any saturate?</li>
+<li><strong>Recommend.</strong> Write a one-page decision memo: measured speed-up, cost saving per run at your GPU price, quality difference, and the risks you found. Include the cases where you would <em>not</em> use FP8.</li>
+</ol>
+</div>
+<h2>Further reading</h2>
+<ul>
+<li>Micikevicius et al., <em>Mixed Precision Training</em> (2017) and <em>FP8 Formats for Deep Learning</em> (2022).</li>
+<li>Goldberg, <em>What Every Computer Scientist Should Know About Floating-Point Arithmetic</em> (1991): the classic reference.</li>
+<li>DeepSeek-AI, <em>DeepSeek-V3 Technical Report</em> (2024), section on FP8 training.</li>
+<li>Open Compute Project, <em>OCP Microscaling Formats (MX) Specification v1.0</em> (2023); Rouhani et al., <em>Microscaling Data Formats for Deep Learning</em> (2023).</li>
+<li>NVIDIA technical blog posts on NVFP4 for inference and training (2025), and the Transformer Engine documentation.</li>
+<li>Dettmers et al., <em>LLM.int8()</em> (2022) and <em>QLoRA</em> (2023); Xiao et al., <em>SmoothQuant</em> (2022).</li>
+<li>Thinking Machines Lab, <em>Defeating Nondeterminism in LLM Inference</em> (2025).</li>
+<li>PyTorch documentation: Automatic Mixed Precision, and <code>torchao</code> float8 training.</li>
+</ul>
+
+</article>
+<script src="../assets/book.js"></script>
+</body>
+</html>

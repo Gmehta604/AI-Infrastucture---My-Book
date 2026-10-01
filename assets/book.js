@@ -61,7 +61,9 @@
   // { parent: 15, file: "15a-gpu-architecture.html", title: "GPU Architecture and the Performance Model" }
   var DEEP_DIVES = [
     { parent: 15, file: "15a-gpu-architecture.html", title: "GPU Architecture and the Performance Model" },
-    { parent: 16, file: "16a-cuda-kernels.html", title: "CUDA Programming and Kernel Optimisation" }
+    { parent: 16, file: "16a-cuda-kernels.html", title: "CUDA Programming and Kernel Optimisation" },
+    { parent: 16, file: "16b-triton-flashattention.html", title: "Triton, Compilers and FlashAttention" },
+    { parent: 16, file: "16c-numerics.html", title: "Numerics: BF16, FP8 and FP4" }
   ];
   // ---- Pinned third-party libraries (loaded from jsDelivr) ---------------
   var HLJS_SRC = "https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js";
